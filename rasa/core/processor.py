@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import warnings
 from types import LambdaType
 from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
@@ -17,7 +18,10 @@ from rasa.core.actions.action import (
 from rasa.core.channels.channel import (
     CollectingOutputChannel,
     OutputChannel,
-    UserMessage,
+    UserMessage
+)
+from rasa.core.channels.evachannel import (
+    EvaOutput
 )
 from rasa.core.constants import (
     USER_INTENT_BACK,
@@ -149,7 +153,7 @@ class MessageProcessor:
         }
 
     async def _update_tracker_session(
-        self, tracker: DialogueStateTracker, output_channel: OutputChannel
+        self, tracker: DialogueStateTracker, output_channel: OutputChannel,
     ) -> None:
         """Check the current session in `tracker` and update it if expired.
 
@@ -174,8 +178,10 @@ class MessageProcessor:
                 nlg=self.nlg,
             )
 
+            self.tracker_store.save(tracker)
+
     async def get_tracker_with_session_start(
-        self, sender_id: Text, output_channel: Optional[OutputChannel] = None
+        self, sender_id: Text, output_channel: Optional[OutputChannel] = None,
     ) -> Optional[DialogueStateTracker]:
         """Get tracker for `sender_id` or create a new tracker for `sender_id`.
 
@@ -328,7 +334,7 @@ class MessageProcessor:
             or not self._is_reminder_still_valid(tracker, reminder_event)
         ):
             logger.debug(
-                f"Canceled reminder because it is outdated ({reminder_event})."
+                f"Canceled reminder because it is outdated. " f"({reminder_event})"
             )
         else:
             intent = reminder_event.intent
@@ -470,7 +476,7 @@ class MessageProcessor:
             self._log_slots(tracker)
 
         logger.debug(
-            f"Logged UserUtterance - tracker now has {len(tracker.events)} events."
+            f"Logged UserUtterance - " f"tracker now has {len(tracker.events)} events."
         )
 
     @staticmethod
@@ -494,6 +500,7 @@ class MessageProcessor:
             )
 
         # action loop. predicts actions until we hit action listen
+        message = ""
         while (
             should_predict_another_action
             and self._should_handle_message(tracker)
@@ -502,10 +509,21 @@ class MessageProcessor:
             # this actually just calls the policy's method by the same name
             action, policy, confidence = self.predict_next_action(tracker)
 
-            should_predict_another_action = await self._run_action(
+            should_predict_another_action, messages = await self._run_action(
                 action, tracker, output_channel, self.nlg, policy, confidence
             )
+            if messages: 
+
+                if len(messages) > 2:
+                    messages = messages[0:2].capitalize() + messages[2:]
+
+                message += messages + ". "
             num_predicted_actions += 1
+        
+        if message and not tracker.get_slot("first_name") is None:            
+            message = message[:-2]
+            message = message.strip()
+            await output_channel.send_response(tracker.sender_id, { 'text': message })
 
         if is_action_limit_reached():
             # circuit breaker was tripped
@@ -539,11 +557,19 @@ class MessageProcessor:
     ) -> None:
         """Send all the bot messages that are logged in the events array."""
 
+        message = ""
         for e in events:
             if not isinstance(e, BotUttered):
                 continue
 
-            await output_channel.send_response(tracker.sender_id, e.message())
+            if not e.message().get("text"):
+                continue
+           
+            message += e.message().get("text")
+
+        return message
+
+        #await output_channel.send_response(tracker.sender_id, { 'text': message })
 
     async def _schedule_reminders(
         self,
@@ -588,7 +614,7 @@ class MessageProcessor:
                         scheduler.remove_job(scheduled_job.id)
 
     async def _run_action(
-        self, action, tracker, output_channel, nlg, policy=None, confidence=None
+        self, action, tracker, output_channel, nlg, policy=None, confidence=None, join=False
     ) -> bool:
         # events and return values are used to update
         # the tracker state after an action has been taken
@@ -614,11 +640,11 @@ class MessageProcessor:
         ):
             self._log_slots(tracker)
 
-        await self._send_bot_messages(events, tracker, output_channel)
+        messages = await self._send_bot_messages(events, tracker, output_channel)
         await self._schedule_reminders(events, tracker, output_channel, nlg)
         await self._cancel_reminders(events, tracker)
 
-        return self.should_predict_another_action(action.name())
+        return self.should_predict_another_action(action.name()), messages
 
     def _warn_about_new_slots(self, tracker, action_name, events) -> None:
         # these are the events from that action we have seen during training
