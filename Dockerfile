@@ -30,8 +30,15 @@ ENV POETRY_VERSION 1.0.3
 RUN curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python
 ENV PATH "/root/.poetry/bin:/opt/venv/bin:${PATH}"
 
+
+RUN git clone https://github.com/jdosoriopu/rasa.git
+
 # copy files
-COPY . /build/
+COPY ./rasa /build/
+COPY rasa/docker/configs/config_pretrained_embeddings_spacy_en_duckling.yml /build/config.yml
+
+# download mitie model
+RUN wget -P /build/data/ https://s3-eu-west-1.amazonaws.com/mitie/total_word_feature_extractor.dat
 
 # change working directory
 WORKDIR /build
@@ -40,10 +47,25 @@ WORKDIR /build
 RUN python -m venv /opt/venv && \
   . /opt/venv/bin/activate && \
   pip install --no-cache-dir -U 'pip<20' && \
-  poetry install --no-dev --no-root --no-interaction && \
+  poetry install --extras full --no-dev --no-root --no-interaction && \
+  make install-mitie && \
   poetry build -f wheel -n && \
   pip install --no-deps dist/*.whl && \
   rm -rf dist *.egg-info
+
+# make sure we use the virtualenv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# spacy link
+RUN python -m spacy download en_core_web_md && \
+    python -m spacy download de_core_news_sm && \
+    python -m spacy link en_core_web_md en && \
+    python -m spacy link de_core_news_sm de
+
+# Install and link spacy models
+RUN python -m spacy download es_core_news_sm
+
+RUN python -m spacy link es_core_news_sm es
 
 # start a new build stage
 FROM base as runner
@@ -59,7 +81,7 @@ WORKDIR /app
 RUN chgrp -R 0 /app && chmod -R g=u /app
 USER 1001
 
-# create a volume for temporary data
+# Create a volume for temporary data
 VOLUME /tmp
 
 # change shell
