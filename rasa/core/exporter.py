@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 import rasa.cli.utils as cli_utils
 from rasa.core.brokers.broker import EventBroker
-from rasa.core.brokers.pika import PikaProducer, PikaEventBroker
+from rasa.core.brokers.pika import PikaEventBroker
 from rasa.core.constants import RASA_EXPORT_PROCESS_ID_HEADER_NAME
 from rasa.core.tracker_store import TrackerStore
 from rasa.core.trackers import EventVerbosity
@@ -49,6 +49,10 @@ class Exporter:
     ) -> None:
         self.endpoints_path = endpoints_path
         self.tracker_store = tracker_store
+        # The `TrackerStore` should return all events on `retrieve` and not just the
+        # ones from the last session.
+        self.tracker_store.load_events_from_previous_conversation_sessions = True
+
         self.event_broker = event_broker
         self.requested_conversation_ids = requested_conversation_ids
         self.minimum_timestamp = minimum_timestamp
@@ -98,7 +102,7 @@ class Exporter:
             `PikaEventBroker`, else `None`.
 
         """
-        if isinstance(self.event_broker, (PikaEventBroker, PikaProducer)):
+        if isinstance(self.event_broker, PikaEventBroker):
             return {RASA_EXPORT_PROCESS_ID_HEADER_NAME: uuid.uuid4().hex}
 
         return None
@@ -112,8 +116,9 @@ class Exporter:
             event: Serialized event to be published.
             headers: Message headers to be published if `self.event_broker` is a
                 `PikaEventBroker`.
+
         """
-        if isinstance(self.event_broker, (PikaEventBroker, PikaProducer)):
+        if isinstance(self.event_broker, PikaEventBroker):
             self.event_broker.publish(event=event, headers=headers)
         else:
             self.event_broker.publish(event)
@@ -135,13 +140,13 @@ class Exporter:
             return conversation_ids_in_tracker_store
 
         raise NoConversationsInTrackerStoreError(
-            f"Could not find any conversations in connected tracker store. "
-            f"Please validate your `endpoints.yml` and make sure the defined "
-            f"tracker store exists. Exiting."
+            "Could not find any conversations in connected tracker store. "
+            "Please validate your `endpoints.yml` and make sure the defined "
+            "tracker store exists. Exiting."
         )
 
     def _validate_all_requested_ids_exist(
-        self, conversation_ids_in_tracker_store: Set[Text],
+        self, conversation_ids_in_tracker_store: Set[Text]
     ) -> None:
         """Warn user if `self.requested_conversation_ids` contains IDs not found in
         `conversation_ids_in_tracker_store`
@@ -257,14 +262,15 @@ class Exporter:
     def _sort_and_select_events_by_timestamp(
         self, events: List[Dict[Text, Any]]
     ) -> List[Dict[Text, Any]]:
-        """Sort list of events by ascending timestamp, and select events within time range.
+        """Sort list of events by ascending timestamp, and select events within time
+        range.
 
         Args:
             events: List of serialized events to be sorted and selected from.
 
         Returns:
-            List of serialized and sorted (by timestamp) events within the requested time
-            range.
+            List of serialized and sorted (by timestamp) events within the requested
+            time range.
 
         Raises:
              `NoEventsInTimeRangeError` error if no events are found within the

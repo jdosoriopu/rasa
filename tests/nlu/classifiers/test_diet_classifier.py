@@ -1,18 +1,24 @@
 import numpy as np
 import pytest
-
 from unittest.mock import Mock
 
+from rasa.nlu.constants import FEATURE_TYPE_SEQUENCE, FEATURE_TYPE_SENTENCE
+from rasa.nlu.featurizers.featurizer import Features
 from rasa.nlu import train
 from rasa.nlu.classifiers import LABEL_RANKING_LENGTH
 from rasa.nlu.config import RasaNLUModelConfig
-from rasa.nlu.constants import TEXT, SPARSE_FEATURE_NAMES, DENSE_FEATURE_NAMES, INTENT
+from rasa.nlu.constants import TEXT, INTENT
 from rasa.utils.tensorflow.constants import (
     LOSS_TYPE,
     RANDOM_SEED,
     RANKING_LENGTH,
     EPOCHS,
     MASKED_LM,
+    TENSORBOARD_LOG_LEVEL,
+    TENSORBOARD_LOG_DIR,
+    EVAL_NUM_EPOCHS,
+    EVAL_NUM_EXAMPLES,
+    BILOU_FLAG,
 )
 from rasa.nlu.classifiers.diet_classifier import DIETClassifier
 from rasa.nlu.model import Interpreter
@@ -46,17 +52,17 @@ def test_compute_default_label_features():
             [
                 Message(
                     "test a",
-                    data={
-                        SPARSE_FEATURE_NAMES[TEXT]: np.zeros(1),
-                        DENSE_FEATURE_NAMES[TEXT]: np.zeros(1),
-                    },
+                    features=[
+                        Features(np.zeros(1), FEATURE_TYPE_SEQUENCE, TEXT, "test"),
+                        Features(np.zeros(1), FEATURE_TYPE_SENTENCE, TEXT, "test"),
+                    ],
                 ),
                 Message(
                     "test b",
-                    data={
-                        SPARSE_FEATURE_NAMES[TEXT]: np.zeros(1),
-                        DENSE_FEATURE_NAMES[TEXT]: np.zeros(1),
-                    },
+                    features=[
+                        Features(np.zeros(1), FEATURE_TYPE_SEQUENCE, TEXT, "test"),
+                        Features(np.zeros(1), FEATURE_TYPE_SENTENCE, TEXT, "test"),
+                    ],
                 ),
             ],
             True,
@@ -65,10 +71,21 @@ def test_compute_default_label_features():
             [
                 Message(
                     "test a",
-                    data={
-                        SPARSE_FEATURE_NAMES[INTENT]: np.zeros(1),
-                        DENSE_FEATURE_NAMES[INTENT]: np.zeros(1),
-                    },
+                    features=[
+                        Features(np.zeros(1), FEATURE_TYPE_SEQUENCE, INTENT, "test"),
+                        Features(np.zeros(1), FEATURE_TYPE_SENTENCE, INTENT, "test"),
+                    ],
+                )
+            ],
+            False,
+        ),
+        (
+            [
+                Message(
+                    "test a",
+                    features=[
+                        Features(np.zeros(2), FEATURE_TYPE_SEQUENCE, INTENT, "test")
+                    ],
                 )
             ],
             False,
@@ -77,8 +94,8 @@ def test_compute_default_label_features():
 )
 def test_check_labels_features_exist(messages, expected):
     attribute = TEXT
-
-    assert DIETClassifier._check_labels_features_exist(messages, attribute) == expected
+    classifier = DIETClassifier()
+    assert classifier._check_labels_features_exist(messages, attribute) == expected
 
 
 @pytest.mark.parametrize(
@@ -123,8 +140,6 @@ async def test_train_persist_load_with_different_settings(
 
 
 async def test_raise_error_on_incorrect_pipeline(component_builder, tmpdir):
-    from rasa.nlu import train
-
     _config = RasaNLUModelConfig(
         {
             "pipeline": [
@@ -300,3 +315,76 @@ async def test_set_random_seed(component_builder, tmpdir):
     result_b = loaded_b.parse("hello")["intent"]["confidence"]
 
     assert result_a == result_b
+
+
+async def test_train_tensorboard_logging(component_builder, tmpdir):
+    from pathlib import Path
+
+    tensorboard_log_dir = Path(tmpdir.strpath) / "tensorboard"
+
+    assert not tensorboard_log_dir.exists()
+
+    _config = RasaNLUModelConfig(
+        {
+            "pipeline": [
+                {"name": "WhitespaceTokenizer"},
+                {"name": "CountVectorsFeaturizer"},
+                {
+                    "name": "DIETClassifier",
+                    EPOCHS: 3,
+                    TENSORBOARD_LOG_LEVEL: "epoch",
+                    TENSORBOARD_LOG_DIR: str(tensorboard_log_dir),
+                    EVAL_NUM_EXAMPLES: 15,
+                    EVAL_NUM_EPOCHS: 1,
+                },
+            ],
+            "language": "en",
+        }
+    )
+
+    await train(
+        _config,
+        path=tmpdir.strpath,
+        data="data/examples/rasa/demo-rasa-multi-intent.md",
+        component_builder=component_builder,
+    )
+
+    assert tensorboard_log_dir.exists()
+
+    all_files = list(tensorboard_log_dir.rglob("*.*"))
+    assert len(all_files) == 3
+
+
+@pytest.mark.parametrize(
+    "classifier_params",
+    [
+        {RANDOM_SEED: 1, EPOCHS: 1, BILOU_FLAG: False},
+        {RANDOM_SEED: 1, EPOCHS: 1, BILOU_FLAG: True},
+    ],
+)
+async def test_train_persist_load_with_composite_entities(
+    classifier_params, component_builder, tmpdir
+):
+    pipeline = as_pipeline(
+        "WhitespaceTokenizer", "CountVectorsFeaturizer", "DIETClassifier"
+    )
+    assert pipeline[2]["name"] == "DIETClassifier"
+    pipeline[2].update(classifier_params)
+
+    _config = RasaNLUModelConfig({"pipeline": pipeline, "language": "en"})
+
+    (trainer, trained, persisted_path) = await train(
+        _config,
+        path=tmpdir.strpath,
+        data="data/test/demo-rasa-composite-entities.md",
+        component_builder=component_builder,
+    )
+
+    assert trainer.pipeline
+    assert trained.pipeline
+
+    loaded = Interpreter.load(persisted_path, component_builder)
+
+    assert loaded.pipeline
+    text = "I am looking for an italian restaurant"
+    assert loaded.parse(text) == trained.parse(text)

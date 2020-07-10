@@ -8,7 +8,7 @@ import traceback
 import typing
 from functools import reduce, wraps
 from inspect import isawaitable
-from typing import Any, Callable, List, Optional, Text, Union
+from typing import Any, Callable, List, Optional, Text, Union, Dict
 
 import rasa
 import rasa.core.utils
@@ -19,10 +19,12 @@ from rasa import model
 from rasa.constants import (
     DEFAULT_DOMAIN_PATH,
     DEFAULT_MODELS_PATH,
+    DEFAULT_RESPONSE_TIMEOUT,
     DOCS_BASE_URL,
     MINIMUM_COMPATIBLE_VERSION,
 )
-from rasa.core.agent import Agent, load_agent
+from rasa.core import agent
+from rasa.core.agent import Agent
 from rasa.core.brokers.broker import EventBroker
 from rasa.core.channels.channel import (
     CollectingOutputChannel,
@@ -39,11 +41,11 @@ from rasa.core.utils import AvailableEndpoints
 from rasa.nlu.emulators.no_emulator import NoEmulator
 from rasa.nlu.test import run_evaluation
 from rasa.utils.endpoints import EndpointConfig
-from sanic import Sanic, Sanic, response, response
-from sanic.request import Request, Request
+from sanic import Sanic, response
+from sanic.request import Request
 from sanic.response import HTTPResponse
-from sanic_cors import CORS, CORS
-from sanic_jwt import Initialize, Initialize, exceptions, exceptions
+from sanic_cors import CORS
+from sanic_jwt import Initialize, exceptions
 
 if typing.TYPE_CHECKING:
     from ssl import SSLContext
@@ -194,6 +196,7 @@ def requires_auth(app: Sanic, token: Optional[Text] = None) -> Callable[[Any], A
 def event_verbosity_parameter(
     request: Request, default_verbosity: EventVerbosity
 ) -> EventVerbosity:
+    """Create `EventVerbosity` object using request params if present."""
     event_verbosity_str = request.args.get(
         "include_events", default_verbosity.name
     ).upper()
@@ -212,24 +215,35 @@ def event_verbosity_parameter(
 
 async def get_tracker(
     processor: "MessageProcessor", conversation_id: Text
-) -> Optional[DialogueStateTracker]:
+) -> DialogueStateTracker:
+    """Get tracker object from `MessageProcessor`."""
     tracker = await processor.get_tracker_with_session_start(conversation_id)
+    _validate_tracker(tracker, conversation_id)
+
+    # `_validate_tracker` ensures we can't return `None` so `Optional` is not needed
+    return tracker  # pytype: disable=bad-return-type
+
+
+def _validate_tracker(
+    tracker: Optional[DialogueStateTracker], conversation_id: Text
+) -> None:
     if not tracker:
         raise ErrorResponse(
             409,
             "Conflict",
-            f"Could not retrieve tracker with id '{conversation_id}'. Most likely "
+            f"Could not retrieve tracker with ID '{conversation_id}'. Most likely "
             f"because there is no domain set on the agent.",
         )
-    return tracker
 
 
 def validate_request_body(request: Request, error_message: Text):
+    """Check if `request` has a body."""
     if not request.body:
         raise ErrorResponse(400, "BadRequest", error_message)
 
 
 async def authenticate(request: Request):
+    """Callback for authentication failed."""
     raise exceptions.AuthenticationFailed(
         "Direct JWT authentication not supported. You should already have "
         "a valid JWT from an authentication provider, Rasa will just make "
@@ -320,7 +334,7 @@ async def _load_agent(
             if not lock_store:
                 lock_store = LockStore.create(endpoints.lock_store)
 
-        loaded_agent = await load_agent(
+        loaded_agent = await agent.load_agent(
             model_path,
             model_server,
             remote_storage,
@@ -362,6 +376,8 @@ def configure_cors(
 
 
 def add_root_route(app: Sanic):
+    """Add '/' route to return hello."""
+
     @app.get("/")
     async def hello(request: Request):
         """Check if the server is running and responds with the version."""
@@ -372,6 +388,7 @@ def create_app(
     agent: Optional["Agent"] = None,
     cors_origins: Union[Text, List[Text], None] = "*",
     auth_token: Optional[Text] = None,
+    response_timeout: int = DEFAULT_RESPONSE_TIMEOUT,
     jwt_secret: Optional[Text] = None,
     jwt_method: Text = "HS256",
     endpoints: Optional[AvailableEndpoints] = None,
@@ -379,7 +396,7 @@ def create_app(
     """Class representing a Rasa HTTP server."""
 
     app = Sanic(__name__)
-    app.config.RESPONSE_TIMEOUT = 60 * 60
+    app.config.RESPONSE_TIMEOUT = response_timeout
     configure_cors(app, cors_origins)
 
     # Setup the Sanic-JWT extension
@@ -471,12 +488,10 @@ def create_app(
 
         try:
             async with app.agent.lock_store.lock(conversation_id):
-                tracker = await get_tracker(
-                    app.agent.create_processor(), conversation_id
-                )
+                processor = app.agent.create_processor()
+                tracker = processor.get_tracker(conversation_id)
+                _validate_tracker(tracker, conversation_id)
 
-                # Get events after tracker initialization to ensure that generated
-                # timestamps are after potential session events.
                 events = _get_events_from_request_body(request)
 
                 for event in events:
@@ -582,15 +597,6 @@ def create_app(
                 {"parameter": "name", "in": "body"},
             )
 
-        # Deprecation warning
-        raise_warning(
-            "Triggering actions via the execute endpoint is deprecated. "
-            "Trigger an intent via the "
-            "`/conversations/<conversation_id>/trigger_intent` "
-            "endpoint instead.",
-            FutureWarning,
-        )
-
         policy = request_params.get("policy", None)
         confidence = request_params.get("confidence", None)
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
@@ -682,7 +688,7 @@ def create_app(
     @app.post("/conversations/<conversation_id>/predict")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def predict(request: Request, conversation_id: Text):
+    async def predict(request: Request, conversation_id: Text) -> HTTPResponse:
         try:
             # Fetches the appropriate bot response in a json format
             responses = await app.agent.predict_next(conversation_id)
@@ -766,6 +772,10 @@ def create_app(
             stories_path = os.path.join(temp_dir, "stories.md")
             rasa.utils.io.write_text_file(rjs["stories"], stories_path)
 
+        if "responses" in rjs:
+            responses_path = os.path.join(temp_dir, "responses.md")
+            rasa.utils.io.write_text_file(rjs["responses"], responses_path)
+
         domain_path = DEFAULT_DOMAIN_PATH
         if "domain" in rjs:
             domain_path = os.path.join(temp_dir, "domain.yml")
@@ -821,7 +831,7 @@ def create_app(
             with app.active_training_processes.get_lock():
                 app.active_training_processes.value -= 1
 
-    def validate_request(rjs):
+    def validate_request(rjs: Dict):
         if "config" not in rjs:
             raise ErrorResponse(
                 400,
@@ -851,7 +861,7 @@ def create_app(
     @app.post("/model/test/stories")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app, require_core_is_ready=True)
-    async def evaluate_stories(request: Request):
+    async def evaluate_stories(request: Request) -> HTTPResponse:
         """Evaluate stories against the currently loaded model."""
         validate_request_body(
             request,
@@ -875,7 +885,7 @@ def create_app(
 
     @app.post("/model/test/intents")
     @requires_auth(app, auth_token)
-    async def evaluate_intents(request: Request):
+    async def evaluate_intents(request: Request) -> HTTPResponse:
         """Evaluate intents against a Rasa model."""
         validate_request_body(
             request,
@@ -917,7 +927,7 @@ def create_app(
     @app.post("/model/predict")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app, require_core_is_ready=True)
-    async def tracker_predict(request: Request):
+    async def tracker_predict(request: Request) -> HTTPResponse:
         """ Given a list of events, predicts the next action"""
         validate_request_body(
             request,
@@ -944,7 +954,7 @@ def create_app(
         try:
             policy_ensemble = app.agent.policy_ensemble
             probabilities, policy = policy_ensemble.probabilities_using_best_policy(
-                tracker, app.agent.domain
+                tracker, app.agent.domain, app.agent.interpreter
             )
 
             scores = [
@@ -968,7 +978,7 @@ def create_app(
     @app.post("/model/parse")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def parse(request: Request):
+    async def parse(request: Request) -> HTTPResponse:
         validate_request_body(
             request,
             "No text message defined in request_body. Add text message to request body "
@@ -1000,7 +1010,7 @@ def create_app(
 
     @app.put("/model")
     @requires_auth(app, auth_token)
-    async def load_model(request: Request):
+    async def load_model(request: Request) -> HTTPResponse:
         validate_request_body(request, "No path to model file defined in request_body.")
 
         model_path = request.json.get("model_file", None)
@@ -1028,7 +1038,7 @@ def create_app(
 
     @app.delete("/model")
     @requires_auth(app, auth_token)
-    async def unload_model(request: Request):
+    async def unload_model(request: Request) -> HTTPResponse:
         model_file = app.agent.model_directory
 
         app.agent = Agent(lock_store=app.agent.lock_store)
@@ -1039,7 +1049,7 @@ def create_app(
     @app.get("/domain")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def get_domain(request: Request):
+    async def get_domain(request: Request) -> HTTPResponse:
         """Get current domain in yaml or json format."""
 
         accepts = request.headers.get("Accept", default="application/json")

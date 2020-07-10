@@ -4,11 +4,20 @@ import random
 from collections import Counter, OrderedDict
 from copy import deepcopy
 from os.path import relpath
-from typing import Any, Dict, List, Optional, Set, Text, Tuple
+from typing import Any, Dict, List, Optional, Set, Text, Tuple, Callable
 
 import rasa.nlu.utils
 from rasa.utils.common import raise_warning, lazy_property
-from rasa.nlu.constants import RESPONSE, RESPONSE_KEY_ATTRIBUTE
+from rasa.nlu.constants import (
+    RESPONSE,
+    RESPONSE_KEY_ATTRIBUTE,
+    NO_ENTITY_TAG,
+    ENTITY_ATTRIBUTE_TYPE,
+    ENTITY_ATTRIBUTE_GROUP,
+    ENTITY_ATTRIBUTE_ROLE,
+    INTENT,
+    ENTITIES,
+)
 from rasa.nlu.training_data.message import Message
 from rasa.nlu.training_data.util import check_duplicate_synonym
 from rasa.nlu.utils import list_to_str
@@ -75,16 +84,20 @@ class TrainingData:
             nlg_stories,
         )
 
-    def filter_by_intent(self, intent: Text):
-        """Filter training examples """
+    def filter_training_examples(
+        self, condition: Callable[[Message], bool]
+    ) -> "TrainingData":
+        """Filter training examples.
 
-        training_examples = []
-        for ex in self.training_examples:
-            if ex.get("intent") == intent:
-                training_examples.append(ex)
+        Args:
+            condition: A function that will be applied to filter training examples.
+
+        Returns:
+            TrainingData: A TrainingData with filtered training examples.
+        """
 
         return TrainingData(
-            training_examples,
+            list(filter(condition, self.training_examples)),
             self.entity_synonyms,
             self.regex_features,
             self.lookup_tables,
@@ -102,70 +115,116 @@ class TrainingData:
     def sanitize_examples(examples: List[Message]) -> List[Message]:
         """Makes sure the training data is clean.
 
-        Remove trailing whitespaces from intent and response annotations and drop duplicate examples."""
+        Remove trailing whitespaces from intent and response annotations and drop
+        duplicate examples.
+        """
 
         for ex in examples:
-            if ex.get("intent"):
-                ex.set("intent", ex.get("intent").strip())
+            if ex.get(INTENT):
+                ex.set(INTENT, ex.get(INTENT).strip())
 
-            if ex.get("response"):
-                ex.set("response", ex.get("response").strip())
+            if ex.get(RESPONSE):
+                ex.set(RESPONSE, ex.get(RESPONSE).strip())
 
         return list(OrderedDict.fromkeys(examples))
 
     @lazy_property
     def intent_examples(self) -> List[Message]:
-        return [ex for ex in self.training_examples if ex.get("intent")]
+        return [ex for ex in self.training_examples if ex.get(INTENT)]
 
     @lazy_property
     def response_examples(self) -> List[Message]:
-        return [ex for ex in self.training_examples if ex.get("response")]
+        return [ex for ex in self.training_examples if ex.get(RESPONSE)]
 
     @lazy_property
     def entity_examples(self) -> List[Message]:
-        return [ex for ex in self.training_examples if ex.get("entities")]
+        return [ex for ex in self.training_examples if ex.get(ENTITIES)]
 
     @lazy_property
     def intents(self) -> Set[Text]:
         """Returns the set of intents in the training data."""
-        return {ex.get("intent") for ex in self.training_examples} - {None}
+        return {ex.get(INTENT) for ex in self.training_examples} - {None}
 
     @lazy_property
     def responses(self) -> Set[Text]:
         """Returns the set of responses in the training data."""
-        return {ex.get("response") for ex in self.training_examples} - {None}
+        return {ex.get(RESPONSE) for ex in self.training_examples} - {None}
 
     @lazy_property
     def retrieval_intents(self) -> Set[Text]:
         """Returns the total number of response types in the training data"""
         return {
-            ex.get("intent")
+            ex.get(INTENT)
             for ex in self.training_examples
-            if ex.get("response") is not None
+            if ex.get(RESPONSE) is not None
         }
 
     @lazy_property
-    def examples_per_intent(self) -> Dict[Text, int]:
+    def number_of_examples_per_intent(self) -> Dict[Text, int]:
         """Calculates the number of examples per intent."""
-        intents = [ex.get("intent") for ex in self.training_examples]
+        intents = [ex.get(INTENT) for ex in self.training_examples]
         return dict(Counter(intents))
 
     @lazy_property
-    def examples_per_response(self) -> Dict[Text, int]:
+    def number_of_examples_per_response(self) -> Dict[Text, int]:
         """Calculates the number of examples per response."""
-        return dict(Counter(self.responses))
+        responses = [
+            ex.get(RESPONSE) for ex in self.training_examples if ex.get(RESPONSE)
+        ]
+        return dict(Counter(responses))
 
     @lazy_property
     def entities(self) -> Set[Text]:
         """Returns the set of entity types in the training data."""
-        entity_types = [e.get("entity") for e in self.sorted_entities()]
+        entity_types = [e.get(ENTITY_ATTRIBUTE_TYPE) for e in self.sorted_entities()]
         return set(entity_types)
 
     @lazy_property
-    def examples_per_entity(self) -> Dict[Text, int]:
+    def entity_roles(self) -> Set[Text]:
+        """Returns the set of entity roles in the training data."""
+        entity_types = [
+            e.get(ENTITY_ATTRIBUTE_ROLE)
+            for e in self.sorted_entities()
+            if ENTITY_ATTRIBUTE_ROLE in e
+        ]
+        return set(entity_types) - {NO_ENTITY_TAG}
+
+    @lazy_property
+    def entity_groups(self) -> Set[Text]:
+        """Returns the set of entity groups in the training data."""
+        entity_types = [
+            e.get(ENTITY_ATTRIBUTE_GROUP)
+            for e in self.sorted_entities()
+            if ENTITY_ATTRIBUTE_GROUP in e
+        ]
+        return set(entity_types) - {NO_ENTITY_TAG}
+
+    def entity_roles_groups_used(self) -> bool:
+        entity_groups_used = (
+            self.entity_groups is not None and len(self.entity_groups) > 0
+        )
+        entity_roles_used = self.entity_roles is not None and len(self.entity_roles) > 0
+
+        return entity_groups_used or entity_roles_used
+
+    @lazy_property
+    def number_of_examples_per_entity(self) -> Dict[Text, int]:
         """Calculates the number of examples per entity."""
-        entity_types = [e.get("entity") for e in self.sorted_entities()]
-        return dict(Counter(entity_types))
+
+        entities = []
+
+        def _append_entity(entity: Dict[Text, Any], attribute: Text) -> None:
+            if attribute in entity:
+                _value = entity.get(attribute)
+                if _value is not None and _value != NO_ENTITY_TAG:
+                    entities.append(f"{attribute} '{_value}'")
+
+        for entity in self.sorted_entities():
+            _append_entity(entity, ENTITY_ATTRIBUTE_TYPE)
+            _append_entity(entity, ENTITY_ATTRIBUTE_ROLE)
+            _append_entity(entity, ENTITY_ATTRIBUTE_GROUP)
+
+        return dict(Counter(entities))
 
     def sort_regex_features(self) -> None:
         """Sorts regex features lexicographically by name+pattern"""
@@ -177,8 +236,8 @@ class TrainingData:
         """Set response phrase for all examples by looking up NLG stories"""
         for example in self.training_examples:
             response_key = example.get(RESPONSE_KEY_ATTRIBUTE)
-            # if response_key is None, that means the corresponding intent is not a retrieval intent
-            # and hence no response text needs to be fetched.
+            # if response_key is None, that means the corresponding intent is not a
+            # retrieval intent and hence no response text needs to be fetched.
             # If response_key is set, fetch the corresponding response text
             if response_key:
                 # look for corresponding bot utterance
@@ -203,16 +262,6 @@ class TrainingData:
 
         return RasaWriter().dumps(self, **kwargs)
 
-    def as_json(self) -> Text:
-
-        raise_warning(
-            "Function 'as_json()' is deprecated and will be removed "
-            "in future versions. Use 'nlu_as_json()' instead.",
-            DeprecationWarning,
-        )
-
-        return self.nlu_as_json()
-
     def nlg_as_markdown(self) -> Text:
         """Generates the markdown representation of the response phrases(NLG) of
         TrainingData."""
@@ -230,17 +279,6 @@ class TrainingData:
         )
 
         return MarkdownWriter().dumps(self)
-
-    def as_markdown(self) -> Text:
-
-        raise_warning(
-            "Function 'as_markdown()' is deprecated and will be removed "
-            "in future versions. Use 'nlu_as_markdown()' and 'nlg_as_markdown()' "
-            "instead.",
-            DeprecationWarning,
-        )
-
-        return self.nlu_as_markdown()
 
     def persist_nlu(self, filename: Text = DEFAULT_TRAINING_DATA_OUTPUT_PATH):
 
@@ -299,7 +337,7 @@ class TrainingData:
         """Sorts the intent examples by the name of the intent and then response"""
 
         return sorted(
-            self.intent_examples, key=lambda e: (e.get("intent"), e.get("response"))
+            self.intent_examples, key=lambda e: (e.get(INTENT), e.get(RESPONSE))
         )
 
     def validate(self) -> None:
@@ -323,7 +361,7 @@ class TrainingData:
             )
 
         # emit warnings for intents with only a few training samples
-        for intent, count in self.examples_per_intent.items():
+        for intent, count in self.number_of_examples_per_intent.items():
             if count < self.MIN_EXAMPLES_PER_INTENT:
                 raise_warning(
                     f"Intent '{intent}' has only {count} training examples! "
@@ -331,10 +369,10 @@ class TrainingData:
                 )
 
         # emit warnings for entities with only a few training samples
-        for entity_type, count in self.examples_per_entity.items():
+        for entity, count in self.number_of_examples_per_entity.items():
             if count < self.MIN_EXAMPLES_PER_ENTITY:
                 raise_warning(
-                    f"Entity '{entity_type}' has only {count} training examples! "
+                    f"Entity {entity} has only {count} training examples! "
                     f"The minimum is {self.MIN_EXAMPLES_PER_ENTITY}, because of "
                     f"this the training may fail."
                 )
@@ -391,34 +429,74 @@ class TrainingData:
     def split_nlu_examples(
         self, train_frac: float, random_seed: Optional[int] = None
     ) -> Tuple[list, list]:
-        train, test = [], []
-        for intent, count in self.examples_per_intent.items():
-            ex = [e for e in self.intent_examples if e.data["intent"] == intent]
-            if random_seed is not None:
-                random.Random(random_seed).shuffle(ex)
-            else:
-                random.shuffle(ex)
+        """Split the training data into a train and test set.
 
-            n_train = int(count * train_frac)
-            train.extend(ex[:n_train])
-            test.extend(ex[n_train:])
+        Args:
+            train_frac: percentage of examples to add to the training set.
+            random_seed: random seed
+
+        Returns:
+            Test and training examples.
+        """
+        train, test = [], []
+        training_examples = set(self.training_examples)
+
+        def _split(_examples: List[Message], _count: int) -> None:
+            if random_seed is not None:
+                random.Random(random_seed).shuffle(_examples)
+            else:
+                random.shuffle(_examples)
+
+            n_train = int(_count * train_frac)
+            train.extend(_examples[:n_train])
+            test.extend(_examples[n_train:])
+
+        # to make sure we have at least one example per response and intent in the
+        # training/test data, we first go over the response examples and then go over
+        # intent examples
+
+        for response, count in self.number_of_examples_per_response.items():
+            examples = [
+                e
+                for e in training_examples
+                if RESPONSE in e.data and e.data[RESPONSE] == response
+            ]
+            _split(examples, count)
+            training_examples = training_examples - set(examples)
+
+        for intent, count in self.number_of_examples_per_intent.items():
+            examples = [
+                e
+                for e in training_examples
+                if INTENT in e.data and e.data[INTENT] == intent
+            ]
+            _split(examples, count)
+            training_examples = training_examples - set(examples)
+
         return test, train
 
     def print_stats(self) -> None:
+        logger.info("Training data stats:")
         logger.info(
-            "Training data stats: \n"
-            + "\t- intent examples: {} ({} distinct intents)\n".format(
-                len(self.intent_examples), len(self.intents)
-            )
-            + "\t- Found intents: {}\n".format(list_to_str(self.intents))
-            + "\t- Number of response examples: {} ({} distinct response)\n".format(
-                len(self.response_examples), len(self.responses)
-            )
-            + "\t- entity examples: {} ({} distinct entities)\n".format(
-                len(self.entity_examples), len(self.entities)
-            )
-            + "\t- found entities: {}\n".format(list_to_str(self.entities))
+            f"Number of intent examples: {len(self.intent_examples)} "
+            f"({len(self.intents)} distinct intents)"
         )
+        if self.intents:
+            logger.info(f"  Found intents: {list_to_str(self.intents)}")
+        logger.info(
+            f"Number of response examples: {len(self.response_examples)} "
+            f"({len(self.responses)} distinct responses)"
+        )
+        logger.info(
+            f"Number of entity examples: {len(self.entity_examples)} "
+            f"({len(self.entities)} distinct entities)"
+        )
+        if self.entities:
+            logger.info(f"  Found entity types: {list_to_str(self.entities)}")
+        if self.entity_roles:
+            logger.info(f"  Found entity roles: {list_to_str(self.entity_roles)}")
+        if self.entity_groups:
+            logger.info(f"  Found entity groups: {list_to_str(self.entity_groups)}")
 
     def is_empty(self) -> bool:
         """Checks if any training data was loaded."""
@@ -429,4 +507,4 @@ class TrainingData:
             self.regex_features,
             self.lookup_tables,
         ]
-        return not any([len(l) > 0 for l in lists_to_check])
+        return not any([len(lst) > 0 for lst in lists_to_check])

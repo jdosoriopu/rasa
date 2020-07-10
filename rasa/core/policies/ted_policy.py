@@ -17,6 +17,7 @@ from rasa.core.featurizers import (
     LabelTokenizerSingleStateFeaturizer,
     MaxHistoryTrackerFeaturizer,
 )
+from rasa.core.interpreter import NaturalLanguageInterpreter, RegexInterpreter
 from rasa.core.policies.policy import Policy
 from rasa.core.constants import DEFAULT_POLICY_PRIORITY, DIALOGUE
 from rasa.core.trackers import DialogueStateTracker
@@ -58,6 +59,8 @@ from rasa.utils.tensorflow.constants import (
     SOFTMAX,
     AUTO,
     BALANCED,
+    TENSORBOARD_LOG_DIR,
+    TENSORBOARD_LOG_LEVEL,
 )
 
 
@@ -106,7 +109,7 @@ class TEDPolicy(Policy):
         NUM_HEADS: 4,
         # If 'True' use key relative embeddings in attention
         KEY_RELATIVE_ATTENTION: False,
-        # If 'True' use key relative embeddings in attention
+        # If 'True' use value relative embeddings in attention
         VALUE_RELATIVE_ATTENTION: False,
         # Max position for relative embeddings
         MAX_RELATIVE_POSITION: None,
@@ -144,13 +147,15 @@ class TEDPolicy(Policy):
         # If 'True' the algorithm only minimizes maximum similarity over
         # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
         USE_MAX_NEG_SIM: True,
-        # Scale loss inverse proportionally to confidence of correct prediction
+        # If 'True' scale loss inverse proportionally to the confidence
+        # of the correct prediction
         SCALE_LOSS: True,
         # ## Regularization parameters
         # The scale of regularization
         REGULARIZATION_CONSTANT: 0.001,
         # The scale of how important is to minimize the maximum similarity
-        # between embeddings of different labels.
+        # between embeddings of different labels,
+        # used only if 'loss_type' is set to 'margin'.
         NEGATIVE_MARGIN_SCALE: 0.8,
         # Dropout rate for embedding layers of dialogue features.
         DROP_RATE_DIALOGUE: 0.1,
@@ -167,6 +172,13 @@ class TEDPolicy(Policy):
         # How many examples to use for hold out validation set
         # Large values may hurt performance, e.g. model accuracy.
         EVAL_NUM_EXAMPLES: 0,
+        # If you want to use tensorboard to visualize training and validation metrics,
+        # set this option to a valid output directory.
+        TENSORBOARD_LOG_DIR: None,
+        # Define when training metrics for tensorboard should be logged.
+        # Either after every epoch or for every training step.
+        # Valid values: 'epoch' and 'minibatch'
+        TENSORBOARD_LOG_LEVEL: "epoch",
     }
 
     @staticmethod
@@ -184,7 +196,7 @@ class TEDPolicy(Policy):
         priority: int = DEFAULT_POLICY_PRIORITY,
         max_history: Optional[int] = None,
         model: Optional[RasaModel] = None,
-        **kwargs: Dict[Text, Any],
+        **kwargs: Any,
     ) -> None:
         """Declare instance variables with default values."""
 
@@ -277,6 +289,7 @@ class TEDPolicy(Policy):
         self,
         training_trackers: List[DialogueStateTracker],
         domain: Domain,
+        interpreter: NaturalLanguageInterpreter,
         **kwargs: Any,
     ) -> None:
         """Train the policy on given training trackers."""
@@ -315,7 +328,11 @@ class TEDPolicy(Policy):
         )
 
     def predict_action_probabilities(
-        self, tracker: DialogueStateTracker, domain: Domain
+        self,
+        tracker: DialogueStateTracker,
+        domain: Domain,
+        interpreter: NaturalLanguageInterpreter = RegexInterpreter(),
+        **kwargs: Any,
     ) -> List[float]:
         """Predict the next action the bot should take.
 
@@ -445,7 +462,12 @@ class TED(RasaModel):
         max_history_tracker_featurizer_used: bool,
         label_data: RasaModelData,
     ) -> None:
-        super().__init__(name="TED", random_seed=config[RANDOM_SEED])
+        super().__init__(
+            name="TED",
+            random_seed=config[RANDOM_SEED],
+            tensorboard_log_dir=config[TENSORBOARD_LOG_DIR],
+            tensorboard_log_level=config[TENSORBOARD_LOG_LEVEL],
+        )
 
         self.config = config
         self.max_history_tracker_featurizer_used = max_history_tracker_featurizer_used
@@ -461,7 +483,7 @@ class TED(RasaModel):
         }
 
         # optimizer
-        self._set_optimizer(tf.keras.optimizers.Adam())
+        self.optimizer = tf.keras.optimizers.Adam()
 
         self.all_labels_embed = None
 

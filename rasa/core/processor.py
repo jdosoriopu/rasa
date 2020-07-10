@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
 import numpy as np
 
-from rasa.constants import DOCS_URL_POLICIES, DOCS_URL_DOMAINS
+from rasa.constants import (
+    DOCS_URL_POLICIES,
+    DOCS_URL_DOMAINS,
+    DEFAULT_NLU_FALLBACK_INTENT_NAME,
+)
 from rasa.core import jobs
 from rasa.core.actions.action import (
     ACTION_LISTEN_NAME,
@@ -29,6 +33,7 @@ from rasa.core.constants import (
     USER_INTENT_RESTART,
     USER_INTENT_SESSION_START,
     UTTER_PREFIX,
+    REQUESTED_SLOT,
 )
 from rasa.core.domain import Domain
 from rasa.core.events import (
@@ -62,6 +67,7 @@ DEFAULT_INTENTS = [
     USER_INTENT_BACK,
     USER_INTENT_OUT_OF_SCOPE,
     USER_INTENT_SESSION_START,
+    DEFAULT_NLU_FALLBACK_INTENT_NAME,
 ]
 
 
@@ -153,7 +159,10 @@ class MessageProcessor:
         }
 
     async def _update_tracker_session(
-        self, tracker: DialogueStateTracker, output_channel: OutputChannel,
+        self,
+        tracker: DialogueStateTracker,
+        output_channel: OutputChannel,
+        metadata: Optional[Dict] = None,
     ) -> None:
         """Check the current session in `tracker` and update it if expired.
 
@@ -162,6 +171,7 @@ class MessageProcessor:
         restart are considered).
 
         Args:
+            metadata: Data sent from client associated with the incoming user message.
             tracker: Tracker to inspect.
             output_channel: Output channel for potential utterances in a custom
                 `ActionSessionStart`.
@@ -176,18 +186,23 @@ class MessageProcessor:
                 tracker=tracker,
                 output_channel=output_channel,
                 nlg=self.nlg,
+                metadata=metadata,
             )
 
             self.tracker_store.save(tracker)
 
     async def get_tracker_with_session_start(
-        self, sender_id: Text, output_channel: Optional[OutputChannel] = None,
+        self,
+        sender_id: Text,
+        output_channel: Optional[OutputChannel] = None,
+        metadata: Optional[Dict] = None,
     ) -> Optional[DialogueStateTracker]:
         """Get tracker for `sender_id` or create a new tracker for `sender_id`.
 
         If a new tracker is created, `action_session_start` is run.
 
         Args:
+            metadata: Data sent from client associated with the incoming user message.
             output_channel: Output channel associated with the incoming user message.
             sender_id: Conversation ID for which to fetch the tracker.
 
@@ -195,13 +210,33 @@ class MessageProcessor:
               Tracker for `sender_id` if available, `None` otherwise.
         """
 
-        tracker = self._get_tracker(sender_id)
+        tracker = self.get_tracker(sender_id)
         if not tracker:
             return None
 
-        await self._update_tracker_session(tracker, output_channel)
+        await self._update_tracker_session(tracker, output_channel, metadata)
 
         return tracker
+
+    def get_tracker(self, conversation_id: Text) -> Optional[DialogueStateTracker]:
+        """Get the tracker for a conversation.
+
+        In contrast to `get_tracker_with_session_start` this does not add any
+        `action_session_start` or `session_start` events at the beginning of a
+        conversation.
+
+        Args:
+            conversation_id: The ID of the conversation for which the history should be
+                retrieved.
+
+        Returns:
+            Tracker for the conversation. Creates an empty tracker in case it's a new
+            conversation.
+        """
+        conversation_id = conversation_id or UserMessage.DEFAULT_SENDER_ID
+        return self.tracker_store.get_or_create_tracker(
+            conversation_id, append_action_listen=False
+        )
 
     async def log_message(
         self, message: UserMessage, should_save_tracker: bool = True
@@ -219,7 +254,7 @@ class MessageProcessor:
         # we have a Tracker instance for each user
         # which maintains conversation state
         tracker = await self.get_tracker_with_session_start(
-            message.sender_id, message.output_channel
+            message.sender_id, message.output_channel, message.metadata
         )
 
         if tracker:
@@ -277,10 +312,12 @@ class MessageProcessor:
         action = self.domain.action_for_index(
             max_confidence_index, self.action_endpoint
         )
+
         logger.debug(
             f"Predicted next action '{action.name()}' with confidence "
             f"{action_confidences[max_confidence_index]:.2f}."
         )
+
         return action, policy, action_confidences[max_confidence_index]
 
     @staticmethod
@@ -391,18 +428,24 @@ class MessageProcessor:
         if slot_values.strip():
             logger.debug(f"Current slot values: \n{slot_values}")
 
-    def _log_unseen_features(self, parse_data: Dict[Text, Any]) -> None:
-        """Check if the NLU interpreter picks up intents or entities that aren't
-        recognized."""
+    def _check_for_unseen_features(self, parse_data: Dict[Text, Any]) -> None:
+        """Warns the user if the NLU parse data contains unrecognized features.
 
-        domain_is_not_empty = self.domain and not self.domain.is_empty()
+        Checks intents and entities picked up by the NLU interpreter
+        against the domain and warns the user of those that don't match.
+        Also considers a list of default intents that are valid but don't
+        need to be listed in the domain.
+
+        Args:
+            parse_data: NLUInterpreter parse data to check against the domain.
+        """
+        if not self.domain or self.domain.is_empty():
+            return
 
         intent = parse_data["intent"]["name"]
         if intent:
-            intent_is_recognized = (
-                domain_is_not_empty and intent in self.domain.intents
-            ) or intent in DEFAULT_INTENTS
-            if not intent_is_recognized:
+            known_intents = self.domain.intents + DEFAULT_INTENTS
+            if intent not in known_intents:
                 raise_warning(
                     f"Interpreter parsed an intent '{intent}' "
                     f"which is not defined in the domain. "
@@ -413,7 +456,7 @@ class MessageProcessor:
         entities = parse_data["entities"] or []
         for element in entities:
             entity = element["entity"]
-            if entity and domain_is_not_empty and entity not in self.domain.entities:
+            if entity and entity not in self.domain.entities:
                 raise_warning(
                     f"Interpreter parsed an entity '{entity}' "
                     f"which is not defined in the domain. "
@@ -444,7 +487,7 @@ class MessageProcessor:
             )
         )
 
-        self._log_unseen_features(parse_data)
+        self._check_for_unseen_features(parse_data)
 
         return parse_data
 
@@ -486,18 +529,30 @@ class MessageProcessor:
             or tracker.latest_message.intent.get("name") == USER_INTENT_RESTART
         )
 
+    def is_action_limit_reached(
+        self, num_predicted_actions: int, should_predict_another_action: bool
+    ) -> bool:
+        """Check whether the maximum number of predictions has been met.
+
+        Args:
+            num_predictes_actions: Number of predicted actions.
+            should_predict_another_action: Whether the last executed action allows
+            for more actions to be predicted or not.
+
+        Returns:
+            `True` if the limit of actions to predict has been reached.
+        """
+        return (
+            num_predicted_actions >= self.max_number_of_predictions
+            and should_predict_another_action
+        )
+
     async def _predict_and_execute_next_action(
         self, output_channel: OutputChannel, tracker: DialogueStateTracker
     ):
         # keep taking actions decided by the policy until it chooses to 'listen'
         should_predict_another_action = True
         num_predicted_actions = 0
-
-        def is_action_limit_reached():
-            return (
-                num_predicted_actions == self.max_number_of_predictions
-                and should_predict_another_action
-            )
 
         # action loop. predicts actions until we hit action listen
         message = ""
@@ -525,7 +580,9 @@ class MessageProcessor:
             message = message.strip()
             await output_channel.send_response(tracker.sender_id, { 'text': message })
 
-        if is_action_limit_reached():
+        if self.is_action_limit_reached(
+            num_predicted_actions, should_predict_another_action
+        ):
             # circuit breaker was tripped
             logger.warning(
                 "Circuit breaker tripped. Stopped predicting "
@@ -614,11 +671,22 @@ class MessageProcessor:
                         scheduler.remove_job(scheduled_job.id)
 
     async def _run_action(
-        self, action, tracker, output_channel, nlg, policy=None, confidence=None, join=False
+        self,
+        action,
+        tracker,
+        output_channel,
+        nlg,
+        policy=None,
+        confidence=None,
+        metadata: Optional[Dict[Text, Any]] = None,
     ) -> bool:
         # events and return values are used to update
         # the tracker state after an action has been taken
         try:
+            # Here we set optional metadata to the ActionSessionStart, which will then
+            # be passed to the SessionStart event. Otherwise the metadata will be lost.
+            if action.name() == ACTION_SESSION_START_NAME:
+                action.metadata = metadata
             events = await action.run(output_channel, nlg, tracker, self.domain)
         except ActionExecutionRejection:
             events = [ActionExecutionRejected(action.name(), policy, confidence)]
@@ -661,7 +729,7 @@ class MessageProcessor:
             if isinstance(e, SlotSet) and e.key not in slots_seen_during_train:
                 s = tracker.slots.get(e.key)
                 if s and s.has_features():
-                    if e.key == "requested_slot" and tracker.active_form:
+                    if e.key == REQUESTED_SLOT and tracker.active_loop:
                         pass
                     else:
                         raise_warning(
@@ -739,12 +807,6 @@ class MessageProcessor:
 
         return has_expired
 
-    def _get_tracker(self, sender_id: Text) -> Optional[DialogueStateTracker]:
-        sender_id = sender_id or UserMessage.DEFAULT_SENDER_ID
-        return self.tracker_store.get_or_create_tracker(
-            sender_id, append_action_listen=False
-        )
-
     def _save_tracker(self, tracker: DialogueStateTracker) -> None:
         self.tracker_store.save(tracker)
 
@@ -778,5 +840,5 @@ class MessageProcessor:
                 )
 
         return self.policy_ensemble.probabilities_using_best_policy(
-            tracker, self.domain
+            tracker, self.domain, self.interpreter
         )

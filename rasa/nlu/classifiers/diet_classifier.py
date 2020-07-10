@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -7,8 +8,9 @@ import scipy.sparse
 import tensorflow as tf
 import tensorflow_addons as tfa
 
-from typing import Any, Dict, List, Optional, Text, Tuple, Union, Type
+from typing import Any, Dict, List, Optional, Text, Tuple, Union, Type, NamedTuple
 
+import rasa.utils.common as common_utils
 import rasa.utils.io as io_utils
 import rasa.nlu.utils.bilou_utils as bilou_utils
 from rasa.nlu.featurizers.featurizer import Featurizer
@@ -16,7 +18,6 @@ from rasa.nlu.components import Component
 from rasa.nlu.classifiers.classifier import IntentClassifier
 from rasa.nlu.extractors.extractor import EntityExtractor
 from rasa.nlu.test import determine_token_labels
-from rasa.nlu.tokenizers.tokenizer import Token
 from rasa.nlu.classifiers import LABEL_RANKING_LENGTH
 from rasa.utils import train_utils
 from rasa.utils.tensorflow import layers
@@ -28,9 +29,10 @@ from rasa.nlu.constants import (
     TEXT,
     ENTITIES,
     NO_ENTITY_TAG,
-    SPARSE_FEATURE_NAMES,
-    DENSE_FEATURE_NAMES,
     TOKENS_NAMES,
+    ENTITY_ATTRIBUTE_TYPE,
+    ENTITY_ATTRIBUTE_GROUP,
+    ENTITY_ATTRIBUTE_ROLE,
 )
 from rasa.nlu.config import RasaNLUModelConfig, InvalidConfigError
 from rasa.nlu.training_data import TrainingData
@@ -54,8 +56,10 @@ from rasa.utils.tensorflow.constants import (
     SIMILARITY_TYPE,
     NUM_NEG,
     SPARSE_INPUT_DROPOUT,
+    DENSE_INPUT_DROPOUT,
     MASKED_LM,
     ENTITY_RECOGNITION,
+    TENSORBOARD_LOG_DIR,
     INTENT_CLASSIFICATION,
     EVAL_NUM_EXAMPLES,
     EVAL_NUM_EPOCHS,
@@ -77,17 +81,36 @@ from rasa.utils.tensorflow.constants import (
     SOFTMAX,
     AUTO,
     BALANCED,
+    TENSORBOARD_LOG_LEVEL,
+    CONCAT_DIMENSION,
+    FEATURIZERS,
 )
 
 
 logger = logging.getLogger(__name__)
 
-TEXT_FEATURES = f"{TEXT}_features"
-LABEL_FEATURES = f"{LABEL}_features"
-TEXT_MASK = f"{TEXT}_mask"
-LABEL_MASK = f"{LABEL}_mask"
+
+SENTENCE = "sentence"
+SEQUENCE = "sequence"
+TEXT_SENTENCE_FEATURES = f"{TEXT}_{SENTENCE}_features"
+LABEL_SENTENCE_FEATURES = f"{LABEL}_{SENTENCE}_features"
+TEXT_SEQUENCE_FEATURES = f"{TEXT}_{SEQUENCE}_features"
+LABEL_SEQUENCE_FEATURES = f"{LABEL}_{SEQUENCE}_features"
+TEXT_SEQUENCE_LENGTH = f"{TEXT}_{SEQUENCE}_lengths"
+LABEL_SEQUENCE_LENGTH = f"{LABEL}_{SEQUENCE}_lengths"
 LABEL_IDS = f"{LABEL}_ids"
 TAG_IDS = "tag_ids"
+
+POSSIBLE_TAGS = [ENTITY_ATTRIBUTE_TYPE, ENTITY_ATTRIBUTE_ROLE, ENTITY_ATTRIBUTE_GROUP]
+
+
+class EntityTagSpec(NamedTuple):
+    """Specification of an entity tag present in the training data."""
+
+    tag_name: Text
+    ids_to_tags: Dict[int, Text]
+    tags_to_ids: Dict[Text, int]
+    num_tags: int
 
 
 class DIETClassifier(IntentClassifier, EntityExtractor):
@@ -125,7 +148,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         NUM_HEADS: 4,
         # If 'True' use key relative embeddings in attention
         KEY_RELATIVE_ATTENTION: False,
-        # If 'True' use key relative embeddings in attention
+        # If 'True' use value relative embeddings in attention
         VALUE_RELATIVE_ATTENTION: False,
         # Max position for relative embeddings
         MAX_RELATIVE_POSITION: None,
@@ -149,6 +172,8 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         EMBEDDING_DIMENSION: 20,
         # Default dense dimension to use if no dense features are present.
         DENSE_DIMENSION: {TEXT: 512, LABEL: 20},
+        # Default dimension to use for concatenating sequence and sentence features.
+        CONCAT_DIMENSION: {TEXT: 512, LABEL: 20},
         # The number of incorrect labels. The algorithm will minimize
         # their similarity to the user input during training.
         NUM_NEG: 20,
@@ -169,13 +194,15 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         # If 'True' the algorithm only minimizes maximum similarity over
         # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
         USE_MAX_NEG_SIM: True,
-        # Scale loss inverse proportionally to confidence of correct prediction
-        SCALE_LOSS: True,
+        # If 'True' scale loss inverse proportionally to the confidence
+        # of the correct prediction
+        SCALE_LOSS: False,
         # ## Regularization parameters
         # The scale of regularization
         REGULARIZATION_CONSTANT: 0.002,
         # The scale of how important is to minimize the maximum similarity
-        # between embeddings of different labels.
+        # between embeddings of different labels,
+        # used only if 'loss_type' is set to 'margin'.
         NEGATIVE_MARGIN_SCALE: 0.8,
         # Dropout rate for encoder
         DROP_RATE: 0.2,
@@ -183,8 +210,10 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         DROP_RATE_ATTENTION: 0,
         # Sparsity of the weights in dense layers
         WEIGHT_SPARSITY: 0.8,
-        # If 'True' apply dropout to sparse tensors
+        # If 'True' apply dropout to sparse input tensors
         SPARSE_INPUT_DROPOUT: True,
+        # If 'True' apply dropout to dense input tensors
+        DENSE_INPUT_DROPOUT: True,
         # ## Evaluation parameters
         # How often calculate validation accuracy.
         # Small values may hurt performance, e.g. model accuracy.
@@ -205,6 +234,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         # examples per entity are required.
         # Rule of thumb: you should have more than 100 examples per entity.
         BILOU_FLAG: True,
+        # If you want to use tensorboard to visualize training and validation metrics,
+        # set this option to a valid output directory.
+        TENSORBOARD_LOG_DIR: None,
+        # Define when training metrics for tensorboard should be logged.
+        # Either after every epoch or for every training step.
+        # Valid values: 'epoch' and 'minibatch'
+        TENSORBOARD_LOG_LEVEL: "epoch",
+        # Specify what features to use as sequence and sentence features
+        # By default all features in the pipeline are used.
+        FEATURIZERS: [],
     }
 
     # init helpers
@@ -260,13 +299,13 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         self,
         component_config: Optional[Dict[Text, Any]] = None,
         index_label_id_mapping: Optional[Dict[int, Text]] = None,
-        index_tag_id_mapping: Optional[Dict[int, Text]] = None,
+        entity_tag_specs: Optional[List[EntityTagSpec]] = None,
         model: Optional[RasaModel] = None,
     ) -> None:
         """Declare instance variables with default values."""
 
         if component_config is not None and EPOCHS not in component_config:
-            logger.warning(
+            common_utils.raise_warning(
                 f"Please configure the number of '{EPOCHS}' in your configuration file."
                 f" We will change the default value of '{EPOCHS}' in the future to 1. "
             )
@@ -277,13 +316,13 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         # transform numbers to labels
         self.index_label_id_mapping = index_label_id_mapping
-        self.index_tag_id_mapping = index_tag_id_mapping
+
+        self._entity_tag_specs = entity_tag_specs
 
         self.model = model
 
-        self.num_tags: Optional[int] = None  # number of entity tags
         self._label_data: Optional[RasaModelData] = None
-        self.data_example: Optional[Dict[Text, List[np.ndarray]]] = None
+        self._data_example: Optional[Dict[Text, List[np.ndarray]]] = None
 
     @property
     def label_key(self) -> Optional[Text]:
@@ -311,20 +350,54 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     def _invert_mapping(mapping: Dict) -> Dict:
         return {value: key for key, value in mapping.items()}
 
-    def _tag_id_index_mapping(self, training_data: TrainingData) -> Dict[Text, int]:
-        """Create tag_id dictionary"""
+    def _create_entity_tag_specs(
+        self, training_data: TrainingData
+    ) -> List[EntityTagSpec]:
+        """Create entity tag specifications with their respective tag id mappings."""
 
-        if self.component_config[BILOU_FLAG]:
-            return bilou_utils.build_tag_id_dict(training_data)
+        _tag_specs = []
 
-        distinct_tag_ids = set(
-            e["entity"]
-            for example in training_data.entity_examples
-            for e in example.get(ENTITIES)
-        ) - {None}
+        for tag_name in POSSIBLE_TAGS:
+            if self.component_config[BILOU_FLAG]:
+                tag_id_index_mapping = bilou_utils.build_tag_id_dict(
+                    training_data, tag_name
+                )
+            else:
+                tag_id_index_mapping = self._tag_id_index_mapping_for(
+                    tag_name, training_data
+                )
+
+            if tag_id_index_mapping:
+                _tag_specs.append(
+                    EntityTagSpec(
+                        tag_name=tag_name,
+                        tags_to_ids=tag_id_index_mapping,
+                        ids_to_tags=self._invert_mapping(tag_id_index_mapping),
+                        num_tags=len(tag_id_index_mapping),
+                    )
+                )
+
+        return _tag_specs
+
+    @staticmethod
+    def _tag_id_index_mapping_for(
+        tag_name: Text, training_data: TrainingData
+    ) -> Optional[Dict[Text, int]]:
+        """Create mapping from tag name to id."""
+        if tag_name == ENTITY_ATTRIBUTE_ROLE:
+            distinct_tags = training_data.entity_roles
+        elif tag_name == ENTITY_ATTRIBUTE_GROUP:
+            distinct_tags = training_data.entity_groups
+        else:
+            distinct_tags = training_data.entities
+
+        distinct_tags = distinct_tags - {NO_ENTITY_TAG} - {None}
+
+        if not distinct_tags:
+            return None
 
         tag_id_dict = {
-            tag_id: idx for idx, tag_id in enumerate(sorted(distinct_tag_ids), 1)
+            tag_id: idx for idx, tag_id in enumerate(sorted(distinct_tags), 1)
         }
         # NO_ENTITY_TAG corresponds to non-entity which should correspond to 0 index
         # needed for correct prediction for padding
@@ -341,40 +414,50 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                 return ex
         return None
 
-    @staticmethod
     def _check_labels_features_exist(
-        labels_example: List[Message], attribute: Text
+        self, labels_example: List[Message], attribute: Text
     ) -> bool:
         """Checks if all labels have features set."""
 
         return all(
-            label_example.get(SPARSE_FEATURE_NAMES[attribute]) is not None
-            or label_example.get(DENSE_FEATURE_NAMES[attribute]) is not None
+            label_example.features_present(
+                attribute, self.component_config[FEATURIZERS]
+            )
             for label_example in labels_example
         )
 
     def _extract_features(
         self, message: Message, attribute: Text
-    ) -> Tuple[Optional[scipy.sparse.spmatrix], Optional[np.ndarray]]:
-        sparse_features = None
-        dense_features = None
+    ) -> Tuple[
+        Optional[scipy.sparse.spmatrix],
+        Optional[scipy.sparse.spmatrix],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+    ]:
 
-        if message.get(SPARSE_FEATURE_NAMES[attribute]) is not None:
-            sparse_features = message.get(SPARSE_FEATURE_NAMES[attribute])
+        (
+            sparse_sequence_features,
+            sparse_sentence_features,
+        ) = message.get_sparse_features(attribute, self.component_config[FEATURIZERS])
+        dense_sequence_features, dense_sentence_features = message.get_dense_features(
+            attribute, self.component_config[FEATURIZERS]
+        )
 
-        if message.get(DENSE_FEATURE_NAMES[attribute]) is not None:
-            dense_features = message.get(DENSE_FEATURE_NAMES[attribute])
-
-        if sparse_features is not None and dense_features is not None:
-            if sparse_features.shape[0] != dense_features.shape[0]:
+        if dense_sequence_features is not None and sparse_sequence_features is not None:
+            if dense_sequence_features.shape[0] != sparse_sequence_features.shape[0]:
                 raise ValueError(
-                    f"Sequence dimensions for sparse and dense features "
+                    f"Sequence dimensions for sparse and dense sequence features "
+                    f"don't coincide in '{message.text}' for attribute '{attribute}'."
+                )
+        if dense_sentence_features is not None and sparse_sentence_features is not None:
+            if dense_sentence_features.shape[0] != sparse_sentence_features.shape[0]:
+                raise ValueError(
+                    f"Sequence dimensions for sparse and dense sentence features "
                     f"don't coincide in '{message.text}' for attribute '{attribute}'."
                 )
 
         # If we don't use the transformer and we don't want to do entity recognition,
         # to speed up training take only the sentence features as feature vector.
-        # It corresponds to the feature vector for the last token - CLS token.
         # We would not make use of the sequence anyway in this setup. Carrying over
         # those features to the actual training process takes quite some time.
         if (
@@ -382,19 +465,42 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             and not self.component_config[ENTITY_RECOGNITION]
             and attribute != INTENT
         ):
-            sparse_features = train_utils.sequence_to_sentence_features(sparse_features)
-            dense_features = train_utils.sequence_to_sentence_features(dense_features)
+            sparse_sequence_features = None
+            dense_sequence_features = None
 
-        return sparse_features, dense_features
+        return (
+            sparse_sequence_features,
+            sparse_sentence_features,
+            dense_sequence_features,
+            dense_sentence_features,
+        )
 
     def _check_input_dimension_consistency(self, model_data: RasaModelData) -> None:
         """Checks if features have same dimensionality if hidden layers are shared."""
 
         if self.component_config.get(SHARE_HIDDEN_LAYERS):
-            num_text_features = model_data.feature_dimension(TEXT_FEATURES)
-            num_label_features = model_data.feature_dimension(LABEL_FEATURES)
+            num_text_sentence_features = model_data.feature_dimension(
+                TEXT_SENTENCE_FEATURES
+            )
+            num_label_sentence_features = model_data.feature_dimension(
+                LABEL_SENTENCE_FEATURES
+            )
+            num_text_sequence_features = model_data.feature_dimension(
+                TEXT_SEQUENCE_FEATURES
+            )
+            num_label_sequence_features = model_data.feature_dimension(
+                LABEL_SEQUENCE_FEATURES
+            )
 
-            if num_text_features != num_label_features:
+            if (
+                num_text_sentence_features > 0
+                and num_label_sentence_features > 0
+                and num_text_sentence_features != num_label_sentence_features
+            ) or (
+                num_text_sequence_features > 0
+                and num_label_sequence_features > 0
+                and num_text_sequence_features != num_label_sequence_features
+            ):
                 raise ValueError(
                     "If embeddings are shared text features and label features "
                     "must coincide. Check the output dimensions of previous components."
@@ -402,29 +508,47 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
     def _extract_labels_precomputed_features(
         self, label_examples: List[Message], attribute: Text = INTENT
-    ) -> List[np.ndarray]:
+    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """Collects precomputed encodings."""
 
-        sparse_features = []
-        dense_features = []
+        sparse_sequence_features = []
+        sparse_sentence_features = []
+        dense_sequence_features = []
+        dense_sentence_features = []
 
         for e in label_examples:
-            _sparse, _dense = self._extract_features(e, attribute)
-            if _sparse is not None:
-                sparse_features.append(_sparse)
-            if _dense is not None:
-                dense_features.append(_dense)
+            (
+                _sparse_sequence,
+                _sparse_sentence,
+                _dense_sequence,
+                _dense_sentence,
+            ) = self._extract_features(e, attribute)
+            if _sparse_sequence is not None:
+                sparse_sequence_features.append(_sparse_sequence)
+            if _sparse_sentence is not None:
+                sparse_sentence_features.append(_sparse_sentence)
+            if _dense_sequence is not None:
+                dense_sequence_features.append(_dense_sequence)
+            if _dense_sentence is not None:
+                dense_sentence_features.append(_dense_sentence)
 
-        sparse_features = np.array(sparse_features)
-        dense_features = np.array(dense_features)
+        sparse_sequence_features = np.array(sparse_sequence_features)
+        sparse_sentence_features = np.array(sparse_sentence_features)
+        dense_sequence_features = np.array(dense_sequence_features)
+        dense_sentence_features = np.array(dense_sentence_features)
 
-        return [sparse_features, dense_features]
+        return (
+            [sparse_sequence_features, dense_sequence_features],
+            [sparse_sentence_features, dense_sentence_features],
+        )
 
     @staticmethod
     def _compute_default_label_features(
         labels_example: List[Message],
     ) -> List[np.ndarray]:
         """Computes one-hot representation for the labels."""
+
+        logger.debug("No label features found. Computing default label features.")
 
         eye_matrix = np.eye(len(labels_example), dtype=np.float32)
         # add sequence dimension to one-hot labels
@@ -458,98 +582,168 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         # Collect features, precomputed if they exist, else compute on the fly
         if self._check_labels_features_exist(labels_example, attribute):
-            features = self._extract_labels_precomputed_features(
-                labels_example, attribute
-            )
+            (
+                sequence_features,
+                sentence_features,
+            ) = self._extract_labels_precomputed_features(labels_example, attribute)
         else:
-            features = self._compute_default_label_features(labels_example)
+            sequence_features = None
+            sentence_features = self._compute_default_label_features(labels_example)
 
         label_data = RasaModelData()
-        label_data.add_features(LABEL_FEATURES, features)
+        label_data.add_features(LABEL_SEQUENCE_FEATURES, sequence_features)
+        label_data.add_features(LABEL_SENTENCE_FEATURES, sentence_features)
+
+        if label_data.feature_not_exist(
+            LABEL_SENTENCE_FEATURES
+        ) and label_data.feature_not_exist(LABEL_SEQUENCE_FEATURES):
+            raise ValueError(
+                "No label features are present. Please check your configuration file."
+            )
 
         label_ids = np.array([idx for (idx, _) in labels_idx_examples])
         # explicitly add last dimension to label_ids
         # to track correctly dynamic sequences
         label_data.add_features(LABEL_IDS, [np.expand_dims(label_ids, -1)])
 
-        label_data.add_mask(LABEL_MASK, LABEL_FEATURES)
+        label_data.add_lengths(LABEL_SEQUENCE_LENGTH, LABEL_SEQUENCE_FEATURES)
 
         return label_data
 
     def _use_default_label_features(self, label_ids: np.ndarray) -> List[np.ndarray]:
-        all_label_features = self._label_data.get(LABEL_FEATURES)[0]
+        all_label_features = self._label_data.get(LABEL_SENTENCE_FEATURES)[0]
         return [np.array([all_label_features[label_id] for label_id in label_ids])]
 
     def _create_model_data(
         self,
         training_data: List[Message],
         label_id_dict: Optional[Dict[Text, int]] = None,
-        tag_id_dict: Optional[Dict[Text, int]] = None,
         label_attribute: Optional[Text] = None,
+        training: bool = True,
     ) -> RasaModelData:
         """Prepare data for training and create a RasaModelData object"""
 
-        X_sparse = []
-        X_dense = []
-        Y_sparse = []
-        Y_dense = []
+        X_sparse_sequence = []
+        X_sparse_sentence = []
+        X_dense_sequence = []
+        X_dense_sentence = []
+        Y_sparse_sequence = []
+        Y_sparse_sentence = []
+        Y_dense_sequence = []
+        Y_dense_sentence = []
         label_ids = []
-        tag_ids = []
+        tag_name_to_tag_ids = defaultdict(list)
 
-        for e in training_data:
-            if label_attribute is None or e.get(label_attribute):
-                _sparse, _dense = self._extract_features(e, TEXT)
-                if _sparse is not None:
-                    X_sparse.append(_sparse)
-                if _dense is not None:
-                    X_dense.append(_dense)
+        for example in training_data:
+            if label_attribute is None or example.get(label_attribute):
+                (
+                    _sparse_sequence,
+                    _sparse_sentence,
+                    _dense_sequence,
+                    _dense_sentence,
+                ) = self._extract_features(example, TEXT)
+                if _sparse_sequence is not None:
+                    X_sparse_sequence.append(_sparse_sequence)
+                if _sparse_sentence is not None:
+                    X_sparse_sentence.append(_sparse_sentence)
+                if _dense_sequence is not None:
+                    X_dense_sequence.append(_dense_sequence)
+                if _dense_sentence is not None:
+                    X_dense_sentence.append(_dense_sentence)
 
-            if e.get(label_attribute):
-                _sparse, _dense = self._extract_features(e, label_attribute)
-                if _sparse is not None:
-                    Y_sparse.append(_sparse)
-                if _dense is not None:
-                    Y_dense.append(_dense)
+            # only add features for intent labels during training
+            if training and example.get(label_attribute):
+                (
+                    _sparse_sequence,
+                    _sparse_sentence,
+                    _dense_sequence,
+                    _dense_sentence,
+                ) = self._extract_features(example, label_attribute)
+                if _sparse_sequence is not None:
+                    Y_sparse_sequence.append(_sparse_sequence)
+                if _sparse_sentence is not None:
+                    Y_sparse_sentence.append(_sparse_sentence)
+                if _dense_sequence is not None:
+                    Y_dense_sequence.append(_dense_sequence)
+                if _dense_sentence is not None:
+                    Y_dense_sentence.append(_dense_sentence)
 
                 if label_id_dict:
-                    label_ids.append(label_id_dict[e.get(label_attribute)])
+                    label_ids.append(label_id_dict[example.get(label_attribute)])
 
-            if self.component_config.get(ENTITY_RECOGNITION) and tag_id_dict:
-                if self.component_config[BILOU_FLAG]:
-                    _tags = bilou_utils.tags_to_ids(e, tag_id_dict)
-                else:
-                    _tags = []
-                    for t in e.get(TOKENS_NAMES[TEXT]):
-                        _tag = determine_token_labels(t, e.get(ENTITIES), None)
-                        _tags.append(tag_id_dict[_tag])
-                # transpose to have seq_len x 1
-                tag_ids.append(np.array([_tags]).T)
+            # only add tag_ids during training
+            if training and self.component_config.get(ENTITY_RECOGNITION):
+                for tag_spec in self._entity_tag_specs:
+                    tag_name_to_tag_ids[tag_spec.tag_name].append(
+                        self._tag_ids_for_crf(example, tag_spec)
+                    )
 
-        X_sparse = np.array(X_sparse)
-        X_dense = np.array(X_dense)
-        Y_sparse = np.array(Y_sparse)
-        Y_dense = np.array(Y_dense)
+        X_sparse_sequence = np.array(X_sparse_sequence)
+        X_sparse_sentence = np.array(X_sparse_sentence)
+        X_dense_sequence = np.array(X_dense_sequence)
+        X_dense_sentence = np.array(X_dense_sentence)
+        Y_sparse_sequence = np.array(Y_sparse_sequence)
+        Y_sparse_sentence = np.array(Y_sparse_sentence)
+        Y_dense_sequence = np.array(Y_dense_sequence)
+        Y_dense_sentence = np.array(Y_dense_sentence)
         label_ids = np.array(label_ids)
-        tag_ids = np.array(tag_ids)
+        tag_name_to_tag_ids = {
+            tag_name: np.array(tag_ids)
+            for tag_name, tag_ids in tag_name_to_tag_ids.items()
+        }
 
         model_data = RasaModelData(label_key=self.label_key)
-        model_data.add_features(TEXT_FEATURES, [X_sparse, X_dense])
-        model_data.add_features(LABEL_FEATURES, [Y_sparse, Y_dense])
-        if label_attribute and model_data.feature_not_exist(LABEL_FEATURES):
+        model_data.add_features(
+            TEXT_SEQUENCE_FEATURES, [X_sparse_sequence, X_dense_sequence]
+        )
+        model_data.add_features(
+            TEXT_SENTENCE_FEATURES, [X_sparse_sentence, X_dense_sentence]
+        )
+        model_data.add_features(
+            LABEL_SEQUENCE_FEATURES, [Y_sparse_sequence, Y_dense_sequence]
+        )
+        model_data.add_features(
+            LABEL_SENTENCE_FEATURES, [Y_sparse_sentence, Y_dense_sentence]
+        )
+
+        if (
+            label_attribute
+            and model_data.feature_not_exist(LABEL_SENTENCE_FEATURES)
+            and model_data.feature_not_exist(LABEL_SEQUENCE_FEATURES)
+        ):
             # no label features are present, get default features from _label_data
             model_data.add_features(
-                LABEL_FEATURES, self._use_default_label_features(label_ids)
+                LABEL_SEQUENCE_FEATURES, self._use_default_label_features(label_ids)
             )
 
         # explicitly add last dimension to label_ids
         # to track correctly dynamic sequences
         model_data.add_features(LABEL_IDS, [np.expand_dims(label_ids, -1)])
-        model_data.add_features(TAG_IDS, [tag_ids])
 
-        model_data.add_mask(TEXT_MASK, TEXT_FEATURES)
-        model_data.add_mask(LABEL_MASK, LABEL_FEATURES)
+        for tag_name, tag_ids in tag_name_to_tag_ids.items():
+            model_data.add_features(f"{tag_name}_{TAG_IDS}", [tag_ids])
+
+        model_data.add_lengths(TEXT_SEQUENCE_LENGTH, TEXT_SEQUENCE_FEATURES)
+        model_data.add_lengths(LABEL_SEQUENCE_LENGTH, LABEL_SEQUENCE_FEATURES)
 
         return model_data
+
+    def _tag_ids_for_crf(self, example: Message, tag_spec: EntityTagSpec) -> np.ndarray:
+        """Create a np.array containing the tag ids of the given message."""
+        if self.component_config[BILOU_FLAG]:
+            _tags = bilou_utils.bilou_tags_to_ids(
+                example, tag_spec.tags_to_ids, tag_spec.tag_name
+            )
+        else:
+            _tags = []
+            for token in example.get(TOKENS_NAMES[TEXT]):
+                _tag = determine_token_labels(
+                    token, example.get(ENTITIES), attribute_key=tag_spec.tag_name
+                )
+                _tags.append(tag_spec.tags_to_ids[_tag])
+
+        # transpose to have seq_len x 1
+        return np.array([_tags]).T
 
     # train helpers
     def preprocess_train_data(self, training_data: TrainingData) -> RasaModelData:
@@ -575,8 +769,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             training_data, label_id_index_mapping, attribute=INTENT
         )
 
-        tag_id_index_mapping = self._tag_id_index_mapping(training_data)
-        self.index_tag_id_mapping = self._invert_mapping(tag_id_index_mapping)
+        self._entity_tag_specs = self._create_entity_tag_specs(training_data)
 
         label_attribute = (
             INTENT if self.component_config[INTENT_CLASSIFICATION] else None
@@ -585,11 +778,8 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         model_data = self._create_model_data(
             training_data.training_examples,
             label_id_index_mapping,
-            tag_id_index_mapping,
             label_attribute=label_attribute,
         )
-
-        self.num_tags = len(self.index_tag_id_mapping)
 
         self._check_input_dimension_consistency(model_data)
 
@@ -606,7 +796,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         **kwargs: Any,
     ) -> None:
         """Train the embedding intent classifier on a data set."""
-
         model_data = self.preprocess_train_data(training_data)
         if model_data.is_empty():
             logger.debug(
@@ -623,14 +812,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                     f"Skipping training of classifier."
                 )
                 return
+        if self.component_config.get(ENTITY_RECOGNITION):
+            self.check_correct_entity_annotations(training_data)
 
         # keep one example for persisting and loading
-        self.data_example = self.data_example = model_data.first_data_example()
+        self._data_example = model_data.first_data_example()
 
         self.model = self.model_class()(
             data_signature=model_data.get_signature(),
             label_data=self._label_data,
-            index_tag_id_mapping=self.index_tag_id_mapping,
+            entity_tag_specs=self._entity_tag_specs,
             config=self.component_config,
         )
 
@@ -647,13 +838,14 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     def _predict(self, message: Message) -> Optional[Dict[Text, tf.Tensor]]:
         if self.model is None:
             logger.debug(
-                "There is no trained model: component is either not trained or "
-                "didn't receive enough training data."
+                f"There is no trained model for '{self.__class__.__name__}': The "
+                f"component is either not trained or didn't receive enough training "
+                f"data."
             )
-            return
+            return None
 
         # create session data from message and convert it into a batch of 1
-        model_data = self._create_model_data([message])
+        model_data = self._create_model_data([message], training=False)
 
         return self.model.predict(model_data)
 
@@ -715,54 +907,40 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         if predict_out is None:
             return []
 
-        # load tf graph and session
-        predictions = predict_out["e_ids"].numpy()
+        predicted_tags, confidence_values = self._entity_label_to_tags(predict_out)
 
-        tags = [self.index_tag_id_mapping[p] for p in predictions[0]]
-
-        if self.component_config[BILOU_FLAG]:
-            tags = bilou_utils.remove_bilou_prefixes(tags)
-
-        entities = self._convert_tags_to_entities(
-            message.text, message.get(TOKENS_NAMES[TEXT], []), tags
+        entities = self.convert_predictions_into_entities(
+            message.text,
+            message.get(TOKENS_NAMES[TEXT], []),
+            predicted_tags,
+            confidence_values,
         )
 
-        extracted = self.add_extractor_name(entities)
-        entities = message.get(ENTITIES, []) + extracted
+        entities = self.add_extractor_name(entities)
+        entities = message.get(ENTITIES, []) + entities
 
         return entities
 
-    @staticmethod
-    def _convert_tags_to_entities(
-        text: Text, tokens: List[Token], tags: List[Text]
-    ) -> List[Dict[Text, Any]]:
-        entities = []
-        last_tag = NO_ENTITY_TAG
-        for token, tag in zip(tokens, tags):
-            if tag == NO_ENTITY_TAG:
-                last_tag = tag
-                continue
+    def _entity_label_to_tags(
+        self, predict_out: Dict[Text, Any]
+    ) -> Tuple[Dict[Text, List[Text]], Dict[Text, List[float]]]:
+        predicted_tags = {}
+        confidence_values = {}
 
-            # new tag found
-            if last_tag != tag:
-                entity = {
-                    "entity": tag,
-                    "start": token.start,
-                    "end": token.end,
-                    "extractor": "DIET",
-                }
-                entities.append(entity)
+        for tag_spec in self._entity_tag_specs:
+            predictions = predict_out[f"e_{tag_spec.tag_name}_ids"].numpy()
+            confidences = predict_out[f"e_{tag_spec.tag_name}_scores"].numpy()
+            confidences = [float(c) for c in confidences[0]]
+            tags = [tag_spec.ids_to_tags[p] for p in predictions[0]]
 
-            # belongs to last entity
-            elif last_tag == tag:
-                entities[-1]["end"] = token.end
+            if self.component_config[BILOU_FLAG]:
+                tags = bilou_utils.ensure_consistent_bilou_tagging(tags)
+                tags = bilou_utils.remove_bilou_prefixes(tags)
 
-            last_tag = tag
+            predicted_tags[tag_spec.tag_name] = tags
+            confidence_values[tag_spec.tag_name] = confidences
 
-        for entity in entities:
-            entity["value"] = text[entity["start"] : entity["end"]]
-
-        return entities
+        return predicted_tags, confidence_values
 
     def process(self, message: Message, **kwargs: Any) -> None:
         """Return the most likely label and its similarity to the input."""
@@ -797,7 +975,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         self.model.save(str(tf_model_file))
 
         io_utils.pickle_dump(
-            model_dir / f"{file_name}.data_example.pkl", self.data_example
+            model_dir / f"{file_name}.data_example.pkl", self._data_example
         )
         io_utils.pickle_dump(
             model_dir / f"{file_name}.label_data.pkl", self._label_data
@@ -806,9 +984,14 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             model_dir / f"{file_name}.index_label_id_mapping.pkl",
             self.index_label_id_mapping,
         )
-        io_utils.json_pickle(
-            model_dir / f"{file_name}.index_tag_id_mapping.pkl",
-            self.index_tag_id_mapping,
+
+        entity_tag_specs = (
+            [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
+            if self._entity_tag_specs
+            else []
+        )
+        io_utils.dump_obj_as_json_to_file(
+            model_dir / f"{file_name}.entity_tag_specs.json", entity_tag_specs
         )
 
         return {"file": file_name}
@@ -826,14 +1009,15 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         if not model_dir or not meta.get("file"):
             logger.debug(
-                f"Failed to load model. "
-                f"Maybe the path '{os.path.abspath(model_dir)}' doesn't exist?"
+                f"Failed to load model for '{cls.__name__}'. "
+                f"Maybe you did not provide enough training data and no model was "
+                f"trained or the path '{os.path.abspath(model_dir)}' doesn't exist?"
             )
             return cls(component_config=meta)
 
         (
             index_label_id_mapping,
-            index_tag_id_mapping,
+            entity_tag_specs,
             label_data,
             meta,
             data_example,
@@ -842,13 +1026,13 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         meta = train_utils.update_similarity_type(meta)
 
         model = cls._load_model(
-            index_tag_id_mapping, label_data, meta, data_example, model_dir
+            entity_tag_specs, label_data, meta, data_example, model_dir
         )
 
         return cls(
             component_config=meta,
             index_label_id_mapping=index_label_id_mapping,
-            index_tag_id_mapping=index_tag_id_mapping,
+            entity_tag_specs=entity_tag_specs,
             model=model,
         )
 
@@ -863,22 +1047,31 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         index_label_id_mapping = io_utils.json_unpickle(
             model_dir / f"{file_name}.index_label_id_mapping.pkl"
         )
-        index_tag_id_mapping = io_utils.json_unpickle(
-            model_dir / f"{file_name}.index_tag_id_mapping.pkl"
+        entity_tag_specs = io_utils.read_json_file(
+            model_dir / f"{file_name}.entity_tag_specs.json"
         )
+        entity_tag_specs = [
+            EntityTagSpec(
+                tag_name=tag_spec["tag_name"],
+                ids_to_tags={
+                    int(key): value for key, value in tag_spec["ids_to_tags"].items()
+                },
+                tags_to_ids={
+                    key: int(value) for key, value in tag_spec["tags_to_ids"].items()
+                },
+                num_tags=tag_spec["num_tags"],
+            )
+            for tag_spec in entity_tag_specs
+        ]
 
         # jsonpickle converts dictionary keys to strings
         index_label_id_mapping = {
             int(key): value for key, value in index_label_id_mapping.items()
         }
-        if index_tag_id_mapping is not None:
-            index_tag_id_mapping = {
-                int(key): value for key, value in index_tag_id_mapping.items()
-            }
 
         return (
             index_label_id_mapping,
-            index_tag_id_mapping,
+            entity_tag_specs,
             label_data,
             meta,
             data_example,
@@ -887,7 +1080,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     @classmethod
     def _load_model(
         cls,
-        index_tag_id_mapping: Dict[int, Text],
+        entity_tag_specs: List[EntityTagSpec],
         label_data: RasaModelData,
         meta: Dict[Text, Any],
         data_example: Dict[Text, List[np.ndarray]],
@@ -904,7 +1097,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             model_data_example,
             data_signature=model_data_example.get_signature(),
             label_data=label_data,
-            index_tag_id_mapping=index_tag_id_mapping,
+            entity_tag_specs=entity_tag_specs,
             config=meta,
         )
 
@@ -932,10 +1125,15 @@ class DIET(RasaModel):
         self,
         data_signature: Dict[Text, List[FeatureSignature]],
         label_data: RasaModelData,
-        index_tag_id_mapping: Optional[Dict[int, Text]],
+        entity_tag_specs: Optional[List[EntityTagSpec]],
         config: Dict[Text, Any],
     ) -> None:
-        super().__init__(name="DIET", random_seed=config[RANDOM_SEED])
+        super().__init__(
+            name="DIET",
+            random_seed=config[RANDOM_SEED],
+            tensorboard_log_dir=config[TENSORBOARD_LOG_DIR],
+            tensorboard_log_level=config[TENSORBOARD_LOG_LEVEL],
+        )
 
         self.config = config
 
@@ -952,48 +1150,98 @@ class DIET(RasaModel):
         self.tf_label_data = self.batch_to_model_data_format(
             label_batch, label_data.get_signature()
         )
-        self._num_tags = (
-            len(index_tag_id_mapping) if index_tag_id_mapping is not None else 0
-        )
+
+        self._entity_tag_specs = self._ordered_tag_specs(entity_tag_specs)
 
         # tf objects
         self._tf_layers: Dict[Text : tf.keras.layers.Layer] = {}
         self._prepare_layers()
 
         # tf training
-        self._set_optimizer(tf.keras.optimizers.Adam(config[LEARNING_RATE]))
+        self.optimizer = tf.keras.optimizers.Adam(config[LEARNING_RATE])
         self._create_metrics()
         self._update_metrics_to_log()
 
         self.all_labels_embed = None  # needed for efficient prediction
 
+    @staticmethod
+    def _ordered_tag_specs(
+        entity_tag_specs: Optional[List[EntityTagSpec]],
+    ) -> List[EntityTagSpec]:
+        """Ensure that order of entity tag specs matches CRF layer order."""
+        if entity_tag_specs is None:
+            return []
+
+        crf_order = [
+            ENTITY_ATTRIBUTE_TYPE,
+            ENTITY_ATTRIBUTE_ROLE,
+            ENTITY_ATTRIBUTE_GROUP,
+        ]
+
+        ordered_tag_spec = []
+
+        for tag_name in crf_order:
+            for tag_spec in entity_tag_specs:
+                if tag_name == tag_spec.tag_name:
+                    ordered_tag_spec.append(tag_spec)
+
+        return ordered_tag_spec
+
     def _check_data(self) -> None:
-        if TEXT_FEATURES not in self.data_signature:
+        if (
+            TEXT_SENTENCE_FEATURES not in self.data_signature
+            and TEXT_SEQUENCE_FEATURES not in self.data_signature
+        ):
             raise InvalidConfigError(
                 f"No text features specified. "
                 f"Cannot train '{self.__class__.__name__}' model."
             )
         if self.config[INTENT_CLASSIFICATION]:
-            if LABEL_FEATURES not in self.data_signature:
+            if (
+                LABEL_SENTENCE_FEATURES not in self.data_signature
+                and LABEL_SEQUENCE_FEATURES not in self.data_signature
+            ):
                 raise InvalidConfigError(
                     f"No label features specified. "
                     f"Cannot train '{self.__class__.__name__}' model."
                 )
-            if (
-                self.config[SHARE_HIDDEN_LAYERS]
-                and self.data_signature[TEXT_FEATURES]
-                != self.data_signature[LABEL_FEATURES]
-            ):
-                raise ValueError(
-                    "If hidden layer weights are shared, data signatures "
-                    "for text_features and label_features must coincide."
-                )
 
-        if self.config[ENTITY_RECOGNITION] and TAG_IDS not in self.data_signature:
-            raise ValueError(
-                f"No tag ids present. "
-                f"Cannot train '{self.__class__.__name__}' model."
+            if self.config[SHARE_HIDDEN_LAYERS]:
+                different_sentence_signatures = False
+                different_sequence_signatures = False
+                if (
+                    TEXT_SENTENCE_FEATURES in self.data_signature
+                    and LABEL_SENTENCE_FEATURES in self.data_signature
+                ):
+                    different_sentence_signatures = (
+                        self.data_signature[TEXT_SENTENCE_FEATURES]
+                        != self.data_signature[LABEL_SENTENCE_FEATURES]
+                    )
+                if (
+                    TEXT_SEQUENCE_FEATURES in self.data_signature
+                    and LABEL_SEQUENCE_FEATURES in self.data_signature
+                ):
+                    different_sequence_signatures = (
+                        self.data_signature[TEXT_SEQUENCE_FEATURES]
+                        != self.data_signature[LABEL_SEQUENCE_FEATURES]
+                    )
+
+                if different_sentence_signatures or different_sequence_signatures:
+                    raise ValueError(
+                        "If hidden layer weights are shared, data signatures "
+                        "for text_features and label_features must coincide."
+                    )
+
+        if (
+            self.config[ENTITY_RECOGNITION]
+            and f"{ENTITY_ATTRIBUTE_TYPE}_{TAG_IDS}" not in self.data_signature
+        ):
+            common_utils.raise_warning(
+                f"You specified '{self.__class__.__name__}' to train entities, but "
+                f"no entities are present in the training data. Skip training of "
+                f"entities."
             )
+            self.config[ENTITY_RECOGNITION] = False
 
     def _create_metrics(self) -> None:
         # self.metrics will have the same order as they are created
@@ -1001,18 +1249,50 @@ class DIET(RasaModel):
         self.mask_loss = tf.keras.metrics.Mean(name="m_loss")
         self.intent_loss = tf.keras.metrics.Mean(name="i_loss")
         self.entity_loss = tf.keras.metrics.Mean(name="e_loss")
+        self.entity_group_loss = tf.keras.metrics.Mean(name="g_loss")
+        self.entity_role_loss = tf.keras.metrics.Mean(name="r_loss")
         # create accuracy metrics second to output accuracies second
         self.mask_acc = tf.keras.metrics.Mean(name="m_acc")
         self.response_acc = tf.keras.metrics.Mean(name="i_acc")
         self.entity_f1 = tf.keras.metrics.Mean(name="e_f1")
+        self.entity_group_f1 = tf.keras.metrics.Mean(name="g_f1")
+        self.entity_role_f1 = tf.keras.metrics.Mean(name="r_f1")
 
     def _update_metrics_to_log(self) -> None:
+        debug_log_level = logging.getLogger("rasa").level == logging.DEBUG
+
         if self.config[MASKED_LM]:
-            self.metrics_to_log += ["m_loss", "m_acc"]
+            self.metrics_to_log.append("m_acc")
+            if debug_log_level:
+                self.metrics_to_log.append("m_loss")
         if self.config[INTENT_CLASSIFICATION]:
-            self.metrics_to_log += ["i_loss", "i_acc"]
+            self.metrics_to_log.append("i_acc")
+            if debug_log_level:
+                self.metrics_to_log.append("i_loss")
         if self.config[ENTITY_RECOGNITION]:
-            self.metrics_to_log += ["e_loss", "e_f1"]
+            for tag_spec in self._entity_tag_specs:
+                if tag_spec.num_tags != 0:
+                    name = tag_spec.tag_name
+                    self.metrics_to_log.append(f"{name[0]}_f1")
+                    if debug_log_level:
+                        self.metrics_to_log.append(f"{name[0]}_loss")
+
+        self._log_metric_info()
+
+    def _log_metric_info(self) -> None:
+        metric_name = {
+            "t": "total",
+            "i": "intent",
+            "e": "entity",
+            "m": "mask",
+            "r": "role",
+            "g": "group",
+        }
+        logger.debug("Following metrics will be logged during training: ")
+        for metric in self.metrics_to_log:
+            parts = metric.split("_")
+            name = f"{metric_name[parts[0]]} {parts[1]}"
+            logger.debug(f"  {metric} ({name})")
 
     def _prepare_layers(self) -> None:
         self.text_name = TEXT
@@ -1035,14 +1315,14 @@ class DIET(RasaModel):
     ) -> None:
         sparse = False
         dense = False
-        for is_sparse, shape in feature_signatures:
+        for is_sparse, feature_dimension in feature_signatures:
             if is_sparse:
                 sparse = True
             else:
                 dense = True
                 # if dense features are present
                 # use the feature dimension of the dense features
-                dense_dim = shape[-1]
+                dense_dim = feature_dimension
 
         if sparse:
             self._tf_layers[f"sparse_to_dense.{name}"] = layers.DenseForSparse(
@@ -1055,15 +1335,6 @@ class DIET(RasaModel):
                 )
 
     def _prepare_input_layers(self, name: Text) -> None:
-        self._tf_layers[f"sparse_dropout.{name}"] = layers.SparseDropout(
-            rate=self.config[DROP_RATE]
-        )
-        self._prepare_sparse_dense_layers(
-            self.data_signature[f"{name}_features"],
-            name,
-            self.config[REGULARIZATION_CONSTANT],
-            self.config[DENSE_DIMENSION][name],
-        )
         self._tf_layers[f"ffnn.{name}"] = layers.Ffnn(
             self.config[HIDDEN_LAYERS_SIZES][name],
             self.config[DROP_RATE],
@@ -1071,6 +1342,29 @@ class DIET(RasaModel):
             self.config[WEIGHT_SPARSITY],
             name,
         )
+        for feature_type in [SENTENCE, SEQUENCE]:
+            if f"{name}_{feature_type}_features" not in self.data_signature:
+                continue
+
+            self._tf_layers[
+                f"sparse_input_dropout.{name}_{feature_type}"
+            ] = layers.SparseDropout(rate=self.config[DROP_RATE])
+            self._tf_layers[
+                f"dense_input_dropout.{name}_{feature_type}"
+            ] = tf.keras.layers.Dropout(rate=self.config[DROP_RATE])
+            self._prepare_sparse_dense_layers(
+                self.data_signature[f"{name}_{feature_type}_features"],
+                f"{name}_{feature_type}",
+                self.config[REGULARIZATION_CONSTANT],
+                self.config[DENSE_DIMENSION][name],
+            )
+            self._tf_layers[f"concat_layer.{name}_{feature_type}"] = layers.Ffnn(
+                [self.config[CONCAT_DIMENSION][name]],
+                self.config[DROP_RATE],
+                self.config[REGULARIZATION_CONSTANT],
+                self.config[WEIGHT_SPARSITY],
+                name,
+            )
 
     def _prepare_embed_layers(self, name: Text) -> None:
         self._tf_layers[f"embed.{name}"] = layers.Embed(
@@ -1080,7 +1374,7 @@ class DIET(RasaModel):
             self.config[SIMILARITY_TYPE],
         )
 
-    def _prepare_dot_product_loss(self, name: Text) -> None:
+    def _prepare_dot_product_loss(self, name: Text, scale_loss: bool) -> None:
         self._tf_layers[f"loss.{name}"] = layers.DotProductLoss(
             self.config[NUM_NEG],
             self.config[LOSS_TYPE],
@@ -1088,7 +1382,7 @@ class DIET(RasaModel):
             self.config[MAX_NEG_SIM],
             self.config[USE_MAX_NEG_SIM],
             self.config[NEGATIVE_MARGIN_SCALE],
-            self.config[SCALE_LOSS],
+            scale_loss,
             # set to 1 to get deterministic behaviour
             parallel_iterations=1 if self.random_seed is not None else 1000,
         )
@@ -1122,119 +1416,246 @@ class DIET(RasaModel):
         self._prepare_embed_layers(f"{name}_lm_mask")
         self._prepare_embed_layers(f"{name}_golden_token")
 
-        self._prepare_dot_product_loss(f"{name}_mask")
+        # mask loss is additional loss
+        # set scaling to False, so that it doesn't overpower other losses
+        self._prepare_dot_product_loss(f"{name}_mask", scale_loss=False)
 
     def _prepare_label_classification_layers(self) -> None:
         self._prepare_embed_layers(TEXT)
         self._prepare_embed_layers(LABEL)
 
-        self._prepare_dot_product_loss(LABEL)
+        self._prepare_dot_product_loss(LABEL, self.config[SCALE_LOSS])
 
     def _prepare_entity_recognition_layers(self) -> None:
-        self._tf_layers["embed.logits"] = layers.Embed(
-            self._num_tags, self.config[REGULARIZATION_CONSTANT], "logits"
-        )
-        self._tf_layers["crf"] = layers.CRF(
-            self._num_tags, self.config[REGULARIZATION_CONSTANT]
-        )
-        self._tf_layers["crf_f1_score"] = tfa.metrics.F1Score(
-            num_classes=self._num_tags - 1,  # `0` prediction is not a prediction
-            average="micro",
-        )
-
-    @staticmethod
-    def _get_sequence_lengths(mask: tf.Tensor) -> tf.Tensor:
-        return tf.cast(tf.reduce_sum(mask[:, :, 0], axis=1), tf.int32)
+        for tag_spec in self._entity_tag_specs:
+            name = tag_spec.tag_name
+            num_tags = tag_spec.num_tags
+            self._tf_layers[f"embed.{name}.logits"] = layers.Embed(
+                num_tags, self.config[REGULARIZATION_CONSTANT], f"logits.{name}"
+            )
+            self._tf_layers[f"crf.{name}"] = layers.CRF(
+                num_tags, self.config[REGULARIZATION_CONSTANT], self.config[SCALE_LOSS]
+            )
+            self._tf_layers[f"embed.{name}.tags"] = layers.Embed(
+                self.config[EMBEDDING_DIMENSION],
+                self.config[REGULARIZATION_CONSTANT],
+                f"tags.{name}",
+            )
 
     def _combine_sparse_dense_features(
         self,
         features: List[Union[np.ndarray, tf.Tensor, tf.SparseTensor]],
-        mask: tf.Tensor,
         name: Text,
+        mask: Optional[tf.Tensor] = None,
         sparse_dropout: bool = False,
-    ) -> tf.Tensor:
+        dense_dropout: bool = False,
+    ) -> Optional[tf.Tensor]:
+
+        if not features:
+            return None
 
         dense_features = []
 
         for f in features:
             if isinstance(f, tf.SparseTensor):
                 if sparse_dropout:
-                    _f = self._tf_layers[f"sparse_dropout.{name}"](f, self._training)
+                    _f = self._tf_layers[f"sparse_input_dropout.{name}"](
+                        f, self._training
+                    )
                 else:
                     _f = f
-                dense_features.append(self._tf_layers[f"sparse_to_dense.{name}"](_f))
+
+                dense_f = self._tf_layers[f"sparse_to_dense.{name}"](_f)
+
+                if dense_dropout:
+                    dense_f = self._tf_layers[f"dense_input_dropout.{name}"](
+                        dense_f, self._training
+                    )
+
+                dense_features.append(dense_f)
             else:
                 dense_features.append(f)
+
+        if mask is None:
+            return tf.concat(dense_features, axis=-1)
 
         return tf.concat(dense_features, axis=-1) * mask
 
     def _features_as_seq_ids(
         self, features: List[Union[np.ndarray, tf.Tensor, tf.SparseTensor]], name: Text
-    ) -> tf.Tensor:
+    ) -> Optional[tf.Tensor]:
         """Creates dense labels for negative sampling."""
 
         # if there are dense features - we can use them
         for f in features:
             if not isinstance(f, tf.SparseTensor):
-                return tf.stop_gradient(f)
+                seq_ids = tf.stop_gradient(f)
+                # add a zero to the seq dimension for the sentence features
+                seq_ids = tf.pad(seq_ids, [[0, 0], [0, 1], [0, 0]])
+                return seq_ids
 
         # use additional sparse to dense layer
         for f in features:
             if isinstance(f, tf.SparseTensor):
-                return tf.stop_gradient(
+                seq_ids = tf.stop_gradient(
                     self._tf_layers[f"sparse_to_dense_ids.{name}"](f)
                 )
+                # add a zero to the seq dimension for the sentence features
+                seq_ids = tf.pad(seq_ids, [[0, 0], [0, 1], [0, 0]])
+                return seq_ids
+
+        return None
+
+    def _combine_sequence_sentence_features(
+        self,
+        sequence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        sentence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        mask_sequence: tf.Tensor,
+        mask_text: tf.Tensor,
+        name: Text,
+        sparse_dropout: bool = False,
+        dense_dropout: bool = False,
+    ) -> tf.Tensor:
+        sequence_x = self._combine_sparse_dense_features(
+            sequence_features,
+            f"{name}_{SEQUENCE}",
+            mask_sequence,
+            sparse_dropout,
+            dense_dropout,
+        )
+        sentence_x = self._combine_sparse_dense_features(
+            sentence_features, f"{name}_{SENTENCE}", None, sparse_dropout, dense_dropout
+        )
+
+        if sequence_x is not None and sentence_x is None:
+            return sequence_x
+
+        if sequence_x is None and sentence_x is not None:
+            return sentence_x
+
+        if sequence_x is not None and sentence_x is not None:
+            return self._concat_sequence_sentence_features(
+                sequence_x, sentence_x, name, mask_text
+            )
+
+        raise ValueError(
+            "No features are present. Please check your configuration file."
+        )
+
+    def _concat_sequence_sentence_features(
+        self,
+        sequence_x: tf.Tensor,
+        sentence_x: tf.Tensor,
+        name: Text,
+        mask_text: tf.Tensor,
+    ):
+        if sequence_x.shape[-1] != sentence_x.shape[-1]:
+            sequence_x = self._tf_layers[f"concat_layer.{name}_{SEQUENCE}"](
+                sequence_x, self._training
+            )
+            sentence_x = self._tf_layers[f"concat_layer.{name}_{SENTENCE}"](
+                sentence_x, self._training
+            )
+
+        # we need to concatenate the sequence features with the sentence features
+        # we cannot use tf.concat as the sequence features are padded
+
+        # (1) get position of sentence features in mask
+        last = mask_text * tf.math.cumprod(
+            1 - mask_text, axis=1, exclusive=True, reverse=True
+        )
+        # (2) multiply by sentence features so that we get a matrix of
+        #     batch-dim x seq-dim x feature-dim with zeros everywhere except for
+        #     for the sentence features
+        sentence_x = last * sentence_x
+
+        # (3) add a zero to the end of sequence matrix to match the final shape
+        sequence_x = tf.pad(sequence_x, [[0, 0], [0, 1], [0, 0]])
+
+        # (4) sum up sequence features and sentence features
+        return sequence_x + sentence_x
 
     def _create_bow(
         self,
-        features: List[Union[tf.Tensor, tf.SparseTensor]],
-        mask: tf.Tensor,
+        sequence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        sentence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        sequence_mask: tf.Tensor,
+        text_mask: tf.Tensor,
         name: Text,
         sparse_dropout: bool = False,
+        dense_dropout: bool = False,
     ) -> tf.Tensor:
 
-        x = self._combine_sparse_dense_features(features, mask, name, sparse_dropout)
+        x = self._combine_sequence_sentence_features(
+            sequence_features,
+            sentence_features,
+            sequence_mask,
+            text_mask,
+            name,
+            sparse_dropout,
+            dense_dropout,
+        )
         x = tf.reduce_sum(x, axis=1)  # convert to bag-of-words
         return self._tf_layers[f"ffnn.{name}"](x, self._training)
 
     def _create_sequence(
         self,
-        features: List[Union[tf.Tensor, tf.SparseTensor]],
+        sequence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        sentence_features: List[Union[tf.Tensor, tf.SparseTensor]],
+        mask_sequence: tf.Tensor,
         mask: tf.Tensor,
         name: Text,
+        sparse_dropout: bool = False,
+        dense_dropout: bool = False,
         masked_lm_loss: bool = False,
         sequence_ids: bool = False,
     ) -> Tuple[tf.Tensor, tf.Tensor, Optional[tf.Tensor], Optional[tf.Tensor]]:
         if sequence_ids:
-            seq_ids = self._features_as_seq_ids(features, name)
+            seq_ids = self._features_as_seq_ids(sequence_features, f"{name}_{SEQUENCE}")
         else:
             seq_ids = None
 
-        inputs = self._combine_sparse_dense_features(
-            features, mask, name, sparse_dropout=self.config[SPARSE_INPUT_DROPOUT]
+        inputs = self._combine_sequence_sentence_features(
+            sequence_features,
+            sentence_features,
+            mask_sequence,
+            mask,
+            name,
+            sparse_dropout,
+            dense_dropout,
         )
-
         inputs = self._tf_layers[f"ffnn.{name}"](inputs, self._training)
 
         if masked_lm_loss:
-            inputs, lm_mask_bool = self._tf_layers[f"{name}_input_mask"](
+            transformer_inputs, lm_mask_bool = self._tf_layers[f"{name}_input_mask"](
                 inputs, mask, self._training
             )
         else:
+            transformer_inputs = inputs
             lm_mask_bool = None
 
         outputs = self._tf_layers[f"{name}_transformer"](
-            inputs, 1 - mask, self._training
+            transformer_inputs, 1 - mask, self._training
         )
-        outputs = tfa.activations.gelu(outputs)
+
+        if self.config[NUM_TRANSFORMER_LAYERS] > 0:
+            # apply activation
+            outputs = tfa.activations.gelu(outputs)
 
         return outputs, inputs, seq_ids, lm_mask_bool
 
     def _create_all_labels(self) -> Tuple[tf.Tensor, tf.Tensor]:
         all_label_ids = self.tf_label_data[LABEL_IDS][0]
+
+        mask_sequence_label = self._get_mask_for(
+            self.tf_label_data, LABEL_SEQUENCE_LENGTH
+        )
+
         x = self._create_bow(
-            self.tf_label_data[LABEL_FEATURES],
-            self.tf_label_data[LABEL_MASK][0],
+            self.tf_label_data[LABEL_SEQUENCE_FEATURES],
+            self.tf_label_data[LABEL_SENTENCE_FEATURES],
+            mask_sequence_label,
+            mask_sequence_label,
             self.label_name,
         )
         all_labels_embed = self._tf_layers[f"embed.{LABEL}"](x)
@@ -1248,23 +1669,6 @@ class DIET(RasaModel):
 
         indices = tf.stack([batch_index, last_sequence_index], axis=1)
         return tf.gather_nd(x, indices)
-
-    def _f1_score_from_ids(
-        self, tag_ids: tf.Tensor, pred_ids: tf.Tensor, mask: tf.Tensor
-    ) -> tf.Tensor:
-        """Calculates f1 score for train predictions"""
-
-        mask_bool = tf.cast(mask[:, :, 0], tf.bool)
-        # pick only non padding values and flatten sequences
-        tag_ids_flat = tf.boolean_mask(tag_ids, mask_bool)
-        pred_ids_flat = tf.boolean_mask(pred_ids, mask_bool)
-        # set `0` prediction to not a prediction
-        tag_ids_flat_one_hot = tf.one_hot(tag_ids_flat - 1, self._num_tags - 1)
-        pred_ids_flat_one_hot = tf.one_hot(pred_ids_flat - 1, self._num_tags - 1)
-
-        return self._tf_layers["crf_f1_score"](
-            tag_ids_flat_one_hot, pred_ids_flat_one_hot
-        )
 
     def _mask_loss(
         self,
@@ -1295,47 +1699,94 @@ class DIET(RasaModel):
         )
 
     def _calculate_label_loss(
-        self, a: tf.Tensor, b: tf.Tensor, label_ids: tf.Tensor
+        self, text_features: tf.Tensor, label_features: tf.Tensor, label_ids: tf.Tensor
     ) -> tf.Tensor:
         all_label_ids, all_labels_embed = self._create_all_labels()
 
-        a_embed = self._tf_layers[f"embed.{TEXT}"](a)
-        b_embed = self._tf_layers[f"embed.{LABEL}"](b)
+        text_embed = self._tf_layers[f"embed.{TEXT}"](text_features)
+        label_embed = self._tf_layers[f"embed.{LABEL}"](label_features)
 
         return self._tf_layers[f"loss.{LABEL}"](
-            a_embed, b_embed, label_ids, all_labels_embed, all_label_ids
+            text_embed, label_embed, label_ids, all_labels_embed, all_label_ids
         )
 
     def _calculate_entity_loss(
         self,
-        outputs: tf.Tensor,
+        inputs: tf.Tensor,
         tag_ids: tf.Tensor,
         mask: tf.Tensor,
         sequence_lengths: tf.Tensor,
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        tag_name: Text,
+        entity_tags: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
 
-        sequence_lengths = sequence_lengths - 1  # remove cls token
         tag_ids = tf.cast(tag_ids[:, :, 0], tf.int32)
-        logits = self._tf_layers["embed.logits"](outputs)
+
+        if entity_tags is not None:
+            _tags = self._tf_layers[f"embed.{tag_name}.tags"](entity_tags)
+            inputs = tf.concat([inputs, _tags], axis=-1)
+
+        logits = self._tf_layers[f"embed.{tag_name}.logits"](inputs)
 
         # should call first to build weights
-        pred_ids = self._tf_layers["crf"](logits, sequence_lengths)
+        pred_ids, _ = self._tf_layers[f"crf.{tag_name}"](logits, sequence_lengths)
         # pytype cannot infer that 'self._tf_layers["crf"]' has the method '.loss'
         # pytype: disable=attribute-error
-        loss = self._tf_layers["crf"].loss(logits, tag_ids, sequence_lengths)
+        loss = self._tf_layers[f"crf.{tag_name}"].loss(
+            logits, tag_ids, sequence_lengths
+        )
+        f1 = self._tf_layers[f"crf.{tag_name}"].f1_score(tag_ids, pred_ids, mask)
         # pytype: enable=attribute-error
 
-        f1 = self._f1_score_from_ids(tag_ids, pred_ids, mask)
+        return loss, f1, logits
 
-        return loss, f1
+    @staticmethod
+    def _compute_mask(sequence_lengths: tf.Tensor) -> tf.Tensor:
+        mask = tf.sequence_mask(sequence_lengths, dtype=tf.float32)
+        # explicitly add last dimension to mask
+        # to track correctly dynamic sequences
+        return tf.expand_dims(mask, -1)
+
+    @staticmethod
+    def _get_sequence_lengths(
+        tf_batch_data: Dict[Text, List[tf.Tensor]], name: Text, batch_dim: int = 1
+    ) -> tf.Tensor:
+        # sentence features have a sequence lengths of 1
+        # if sequence features are present we add the sequence lengths of those
+
+        sequence_lengths = tf.ones([batch_dim], dtype=tf.int32)
+        if name in tf_batch_data:
+            sequence_lengths += tf.cast(tf_batch_data[name][0], dtype=tf.int32)
+
+        return sequence_lengths
+
+    def _get_mask_for(
+        self, tf_batch_data: Dict[Text, List[tf.Tensor]], name: Text
+    ) -> Optional[tf.Tensor]:
+        if name not in tf_batch_data:
+            return None
+
+        sequence_lengths = tf.cast(tf_batch_data[name][0], dtype=tf.int32)
+        return self._compute_mask(sequence_lengths)
+
+    @staticmethod
+    def _get_batch_dim(tf_batch_data: Dict[Text, List[tf.Tensor]]) -> int:
+        if TEXT_SEQUENCE_FEATURES in tf_batch_data:
+            return tf.shape(tf_batch_data[TEXT_SEQUENCE_FEATURES][0])[0]
+
+        return tf.shape(tf_batch_data[TEXT_SENTENCE_FEATURES][0])[0]
 
     def batch_loss(
         self, batch_in: Union[Tuple[tf.Tensor], Tuple[np.ndarray]]
     ) -> tf.Tensor:
         tf_batch_data = self.batch_to_model_data_format(batch_in, self.data_signature)
 
-        mask_text = tf_batch_data[TEXT_MASK][0]
-        sequence_lengths = self._get_sequence_lengths(mask_text)
+        batch_dim = self._get_batch_dim(tf_batch_data)
+        mask_sequence_text = self._get_mask_for(tf_batch_data, TEXT_SEQUENCE_LENGTH)
+        sequence_lengths = self._get_sequence_lengths(
+            tf_batch_data, TEXT_SEQUENCE_LENGTH, batch_dim
+        )
+        mask_text = self._compute_mask(sequence_lengths)
 
         (
             text_transformed,
@@ -1343,10 +1794,14 @@ class DIET(RasaModel):
             text_seq_ids,
             lm_mask_bool_text,
         ) = self._create_sequence(
-            tf_batch_data[TEXT_FEATURES],
+            tf_batch_data[TEXT_SEQUENCE_FEATURES],
+            tf_batch_data[TEXT_SENTENCE_FEATURES],
+            mask_sequence_text,
             mask_text,
             self.text_name,
-            self.config[MASKED_LM],
+            sparse_dropout=self.config[SPARSE_INPUT_DROPOUT],
+            dense_dropout=self.config[DENSE_INPUT_DROPOUT],
+            masked_lm_loss=self.config[MASKED_LM],
             sequence_ids=True,
         )
 
@@ -1361,31 +1816,100 @@ class DIET(RasaModel):
             losses.append(loss)
 
         if self.config[INTENT_CLASSIFICATION]:
-            # get _cls_ vector for intent classification
-            cls = self._last_token(text_transformed, sequence_lengths)
-
-            label_ids = tf_batch_data[LABEL_IDS][0]
-            label = self._create_bow(
-                tf_batch_data[LABEL_FEATURES],
-                tf_batch_data[LABEL_MASK][0],
-                self.label_name,
+            loss = self._batch_loss_intent(
+                sequence_lengths, mask_text, text_transformed, tf_batch_data
             )
-            loss, acc = self._calculate_label_loss(cls, label, label_ids)
-            self.intent_loss.update_state(loss)
-            self.response_acc.update_state(acc)
             losses.append(loss)
 
         if self.config[ENTITY_RECOGNITION]:
-            tag_ids = tf_batch_data[TAG_IDS][0]
-
-            loss, f1 = self._calculate_entity_loss(
-                text_transformed, tag_ids, mask_text, sequence_lengths
+            losses += self._batch_loss_entities(
+                mask_text, sequence_lengths, text_transformed, tf_batch_data
             )
-            self.entity_loss.update_state(loss)
-            self.entity_f1.update_state(f1)
-            losses.append(loss)
 
         return tf.math.add_n(losses)
+
+    def _batch_loss_intent(
+        self,
+        sequence_lengths: tf.Tensor,
+        mask_text: tf.Tensor,
+        text_transformed: tf.Tensor,
+        tf_batch_data: Dict[Text, List[tf.Tensor]],
+    ) -> tf.Tensor:
+        # get sentence features vector for intent classification
+        sentence_vector = self._last_token(text_transformed, sequence_lengths)
+
+        mask_sequence_label = self._get_mask_for(tf_batch_data, LABEL_SEQUENCE_LENGTH)
+
+        label_ids = tf_batch_data[LABEL_IDS][0]
+        label = self._create_bow(
+            tf_batch_data[LABEL_SEQUENCE_FEATURES],
+            tf_batch_data[LABEL_SENTENCE_FEATURES],
+            mask_sequence_label,
+            mask_text,
+            self.label_name,
+        )
+
+        loss, acc = self._calculate_label_loss(sentence_vector, label, label_ids)
+
+        self.intent_loss.update_state(loss)
+        self.response_acc.update_state(acc)
+
+        return loss
+
+    def _batch_loss_entities(
+        self,
+        mask_text: tf.Tensor,
+        sequence_lengths: tf.Tensor,
+        text_transformed: tf.Tensor,
+        tf_batch_data: Dict[Text, List[tf.Tensor]],
+    ) -> List[tf.Tensor]:
+        losses = []
+
+        sequence_lengths -= 1  # remove sentence features
+
+        entity_tags = None
+
+        for tag_spec in self._entity_tag_specs:
+            if tag_spec.num_tags == 0:
+                continue
+
+            tag_ids = tf_batch_data[f"{tag_spec.tag_name}_{TAG_IDS}"][0]
+            # add a zero (no entity) for the sentence features to match the shape of
+            # inputs
+            tag_ids = tf.pad(tag_ids, [[0, 0], [0, 1], [0, 0]])
+
+            loss, f1, _logits = self._calculate_entity_loss(
+                text_transformed,
+                tag_ids,
+                mask_text,
+                sequence_lengths,
+                tag_spec.tag_name,
+                entity_tags,
+            )
+
+            if tag_spec.tag_name == ENTITY_ATTRIBUTE_TYPE:
+                # use the entity tags as additional input for the role
+                # and group CRF
+                entity_tags = tf.one_hot(
+                    tf.cast(tag_ids[:, :, 0], tf.int32), depth=tag_spec.num_tags
+                )
+
+            self._update_entity_metrics(loss, f1, tag_spec.tag_name)
+
+            losses.append(loss)
+
+        return losses
+
+    def _update_entity_metrics(self, loss: tf.Tensor, f1: tf.Tensor, tag_name: Text):
+        if tag_name == ENTITY_ATTRIBUTE_TYPE:
+            self.entity_loss.update_state(loss)
+            self.entity_f1.update_state(f1)
+        elif tag_name == ENTITY_ATTRIBUTE_GROUP:
+            self.entity_group_loss.update_state(loss)
+            self.entity_group_f1.update_state(f1)
+        elif tag_name == ENTITY_ATTRIBUTE_ROLE:
+            self.entity_role_loss.update_state(loss)
+            self.entity_role_f1.update_state(f1)
 
     def batch_predict(
         self, batch_in: Union[Tuple[tf.Tensor], Tuple[np.ndarray]]
@@ -1394,40 +1918,95 @@ class DIET(RasaModel):
             batch_in, self.predict_data_signature
         )
 
-        mask_text = tf_batch_data[TEXT_MASK][0]
-        sequence_lengths = self._get_sequence_lengths(mask_text)
-
-        text_transformed, _, _, _ = self._create_sequence(
-            tf_batch_data[TEXT_FEATURES], mask_text, self.text_name
+        mask_sequence_text = self._get_mask_for(tf_batch_data, TEXT_SEQUENCE_LENGTH)
+        sequence_lengths = self._get_sequence_lengths(
+            tf_batch_data, TEXT_SEQUENCE_LENGTH, batch_dim=1
         )
 
-        out = {}
+        mask = self._compute_mask(sequence_lengths)
+
+        text_transformed, _, _, _ = self._create_sequence(
+            tf_batch_data[TEXT_SEQUENCE_FEATURES],
+            tf_batch_data[TEXT_SENTENCE_FEATURES],
+            mask_sequence_text,
+            mask,
+            self.text_name,
+        )
+
+        predictions: Dict[Text, tf.Tensor] = {}
+
         if self.config[INTENT_CLASSIFICATION]:
-            if self.all_labels_embed is None:
-                _, self.all_labels_embed = self._create_all_labels()
-
-            # get _cls_ vector for intent classification
-            cls = self._last_token(text_transformed, sequence_lengths)
-            cls_embed = self._tf_layers[f"embed.{TEXT}"](cls)
-
-            # pytype cannot infer that 'self._tf_layers[f"loss.{LABEL}"]' has methods
-            # like '.sim' or '.confidence_from_sim'
-            # pytype: disable=attribute-error
-            sim_all = self._tf_layers[f"loss.{LABEL}"].sim(
-                cls_embed[:, tf.newaxis, :], self.all_labels_embed[tf.newaxis, :, :]
+            predictions.update(
+                self._batch_predict_intents(sequence_lengths, text_transformed)
             )
-            scores = self._tf_layers[f"loss.{LABEL}"].confidence_from_sim(
-                sim_all, self.config[SIMILARITY_TYPE]
-            )
-            # pytype: enable=attribute-error
-            out["i_scores"] = scores
 
         if self.config[ENTITY_RECOGNITION]:
-            logits = self._tf_layers["embed.logits"](text_transformed)
-            pred_ids = self._tf_layers["crf"](logits, sequence_lengths - 1)
-            out["e_ids"] = pred_ids
+            predictions.update(
+                self._batch_predict_entities(sequence_lengths, text_transformed)
+            )
 
-        return out
+        return predictions
+
+    def _batch_predict_entities(
+        self, sequence_lengths: tf.Tensor, text_transformed: tf.Tensor
+    ) -> Dict[Text, tf.Tensor]:
+        predictions: Dict[Text, tf.Tensor] = {}
+
+        entity_tags = None
+
+        for tag_spec in self._entity_tag_specs:
+            # skip crf layer if it was not trained
+            if tag_spec.num_tags == 0:
+                continue
+
+            name = tag_spec.tag_name
+            _input = text_transformed
+
+            if entity_tags is not None:
+                _tags = self._tf_layers[f"embed.{name}.tags"](entity_tags)
+                _input = tf.concat([_input, _tags], axis=-1)
+
+            _logits = self._tf_layers[f"embed.{name}.logits"](_input)
+            pred_ids, confidences = self._tf_layers[f"crf.{name}"](
+                _logits, sequence_lengths - 1
+            )
+
+            predictions[f"e_{name}_ids"] = pred_ids
+            predictions[f"e_{name}_scores"] = confidences
+
+            if name == ENTITY_ATTRIBUTE_TYPE:
+                # use the entity tags as additional input for the role
+                # and group CRF
+                entity_tags = tf.one_hot(
+                    tf.cast(pred_ids, tf.int32), depth=tag_spec.num_tags
+                )
+
+        return predictions
+
+    def _batch_predict_intents(
+        self, sequence_lengths: tf.Tensor, text_transformed: tf.Tensor
+    ) -> Dict[Text, tf.Tensor]:
+
+        if self.all_labels_embed is None:
+            _, self.all_labels_embed = self._create_all_labels()
+
+        # get sentence feature vector for intent classification
+        sentence_vector = self._last_token(text_transformed, sequence_lengths)
+        sentence_vector_embed = self._tf_layers[f"embed.{TEXT}"](sentence_vector)
+
+        # pytype cannot infer that 'self._tf_layers[f"loss.{LABEL}"]' has methods
+        # like '.sim' or '.confidence_from_sim'
+        # pytype: disable=attribute-error
+        sim_all = self._tf_layers[f"loss.{LABEL}"].sim(
+            sentence_vector_embed[:, tf.newaxis, :],
+            self.all_labels_embed[tf.newaxis, :, :],
+        )
+        scores = self._tf_layers[f"loss.{LABEL}"].confidence_from_sim(
+            sim_all, self.config[SIMILARITY_TYPE]
+        )
+        # pytype: enable=attribute-error
+
+        return {"i_scores": scores}
 
 
 # pytype: enable=key-error

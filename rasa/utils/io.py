@@ -4,22 +4,23 @@ import json
 import logging
 import os
 import pickle
+import re
 import tarfile
 import tempfile
-import typing
 import warnings
 import zipfile
 import glob
 from asyncio import AbstractEventLoop
+from collections import OrderedDict
 from io import BytesIO as IOReader
 from pathlib import Path
-from typing import Text, Any, Dict, Union, List, Type, Callable
+from typing import Text, Any, Dict, Union, List, Type, Callable, TYPE_CHECKING
 
 import ruamel.yaml as yaml
 
-from rasa.constants import ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL
+from rasa.constants import ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL, YAML_VERSION
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
     from prompt_toolkit.validation import Validator
 
 DEFAULT_ENCODING = "utf-8"
@@ -76,9 +77,6 @@ def fix_yaml_loader() -> None:
 
 def replace_environment_variables() -> None:
     """Enable yaml loader to process the environment variables in the yaml."""
-    import re
-    import os
-
     # eg. ${USER_NAME}, ${PASSWORD}
     env_var_pattern = re.compile(r"^(.*)\$\{(.*)\}(.*)$")
     yaml.add_implicit_resolver("!env_var", env_var_pattern)
@@ -99,38 +97,39 @@ def replace_environment_variables() -> None:
     yaml.SafeConstructor.add_constructor("!env_var", env_var_constructor)
 
 
-def read_yaml(content: Text) -> Union[List[Any], Dict[Text, Any]]:
+def read_yaml(content: Text) -> Any:
     """Parses yaml from a text.
 
-     Args:
+    Args:
         content: A text containing yaml content.
+
+    Raises:
+        ruamel.yaml.parser.ParserError: If there was an error when parsing the YAML.
     """
     fix_yaml_loader()
 
     replace_environment_variables()
 
     yaml_parser = yaml.YAML(typ="safe")
-    yaml_parser.version = "1.2"
-    yaml_parser.unicode_supplementary = True
+    yaml_parser.version = YAML_VERSION
 
-    # noinspection PyUnresolvedReferences
-    try:
-        return yaml_parser.load(content) or {}
-    except yaml.scanner.ScannerError:
-        # A `ruamel.yaml.scanner.ScannerError` might happen due to escaped
-        # unicode sequences that form surrogate pairs. Try converting the input
-        # to a parsable format based on
-        # https://stackoverflow.com/a/52187065/3429596.
+    if _is_ascii(content):
+        # Required to make sure emojis are correctly parsed
         content = (
             content.encode("utf-8")
             .decode("raw_unicode_escape")
             .encode("utf-16", "surrogatepass")
             .decode("utf-16")
         )
-        return yaml_parser.load(content) or {}
+
+    return yaml_parser.load(content) or {}
 
 
-def read_file(filename: Text, encoding: Text = DEFAULT_ENCODING) -> Any:
+def _is_ascii(text: Text) -> bool:
+    return all(ord(character) < 128 for character in text)
+
+
+def read_file(filename: Union[Text, Path], encoding: Text = DEFAULT_ENCODING) -> Any:
     """Read text from a file."""
 
     try:
@@ -140,7 +139,7 @@ def read_file(filename: Text, encoding: Text = DEFAULT_ENCODING) -> Any:
         raise ValueError(f"File '{filename}' does not exist.")
 
 
-def read_json_file(filename: Text) -> Any:
+def read_json_file(filename: Union[Text, Path]) -> Any:
     """Read json from a file."""
     content = read_file(filename)
     try:
@@ -152,7 +151,7 @@ def read_json_file(filename: Text) -> Any:
         )
 
 
-def dump_obj_as_json_to_file(filename: Text, obj: Any) -> None:
+def dump_obj_as_json_to_file(filename: Union[Text, Path], obj: Any) -> None:
     """Dump an object as a json string to a file."""
 
     write_text_file(json.dumps(obj, indent=2), filename)
@@ -184,7 +183,7 @@ def pickle_load(filename: Union[Text, Path]) -> Any:
 def read_config_file(filename: Text) -> Dict[Text, Any]:
     """Parses a yaml configuration file. Content needs to be a dictionary
 
-     Args:
+    Args:
         filename: The path to the file which should be read.
     """
     content = read_yaml(read_file(filename))
@@ -201,10 +200,10 @@ def read_config_file(filename: Text) -> Dict[Text, Any]:
         )
 
 
-def read_yaml_file(filename: Text) -> Union[List[Any], Dict[Text, Any]]:
+def read_yaml_file(filename: Union[Text, Path]) -> Union[List[Any], Dict[Text, Any]]:
     """Parses a yaml file.
 
-     Args:
+    Args:
         filename: The path to the file which should be read.
     """
     return read_yaml(read_file(filename, DEFAULT_ENCODING))
@@ -227,14 +226,58 @@ def unarchive(byte_array: bytes, directory: Text) -> Text:
         return directory
 
 
-def write_yaml_file(data: Dict, filename: Union[Text, Path]) -> None:
+def convert_to_ordered_dict(obj: Any) -> Any:
+    """Convert object to an `OrderedDict`.
+
+    Args:
+        obj: Object to convert.
+
+    Returns:
+        An `OrderedDict` with all nested dictionaries converted if `obj` is a
+        dictionary, otherwise the object itself.
+    """
+    # use recursion on lists
+    if isinstance(obj, list):
+        return [convert_to_ordered_dict(element) for element in obj]
+
+    if isinstance(obj, dict):
+        out = OrderedDict()
+        # use recursion on dictionaries
+        for k, v in obj.items():
+            out[k] = convert_to_ordered_dict(v)
+
+        return out
+
+    # return all other objects
+    return obj
+
+
+def _enable_ordered_dict_yaml_dumping() -> None:
+    """Ensure that `OrderedDict`s are dumped so that the order of keys is respected."""
+
+    def _order_rep(dumper: yaml.Representer, _data: Dict[Any, Any]) -> Any:
+        return dumper.represent_mapping(
+            "tag:yaml.org,2002:map", _data.items(), flow_style=False
+        )
+
+    yaml.add_representer(OrderedDict, _order_rep)
+
+
+def write_yaml_file(
+    data: Any, filename: Union[Text, Path], should_preserve_key_order: bool = False
+) -> None:
     """Writes a yaml file.
 
-     Args:
+    Args:
         data: The data to write.
         filename: The path to the file which should be written.
+        should_preserve_key_order: Whether to preserve key order in `data`.
     """
-    with open(str(filename), "w", encoding=DEFAULT_ENCODING) as outfile:
+    if should_preserve_key_order:
+        _enable_ordered_dict_yaml_dumping()
+        data = convert_to_ordered_dict(data)
+
+    with Path(filename).open("w", encoding=DEFAULT_ENCODING) as outfile:
         yaml.dump(data, outfile, default_flow_style=False, allow_unicode=True)
 
 
@@ -416,7 +459,6 @@ def create_directory(directory_path: Text) -> None:
 
 def zip_folder(folder: Text) -> Text:
     """Create an archive from a folder."""
-    import tempfile
     import shutil
 
     zipped_path = tempfile.NamedTemporaryFile(delete=False)

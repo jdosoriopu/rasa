@@ -1,12 +1,11 @@
 import asyncio
-import os
 import random
 import uuid
 
 from sanic.request import Request
 from sanic.testing import SanicTestClient
 
-from typing import Tuple, Iterator
+from typing import Iterator, Callable
 
 import pytest
 from _pytest.tmpdir import TempdirFactory
@@ -26,7 +25,7 @@ from rasa.core.events import UserUttered
 from rasa.core.exporter import Exporter
 from rasa.core.policies import Policy
 from rasa.core.policies.memoization import AugmentedMemoizationPolicy
-from rasa.core.run import _create_app_without_api
+import rasa.core.run
 from rasa.core.tracker_store import InMemoryTrackerStore, TrackerStore
 from rasa.model import get_model
 from rasa.train import train_async
@@ -38,15 +37,16 @@ from tests.core.conftest import (
     DEFAULT_STACK_CONFIG,
     DEFAULT_STORIES_FILE,
     END_TO_END_STORY_FILE,
-    MOODBOT_MODEL_PATH,
+    INCORRECT_NLU_DATA,
 )
-from tests.utilities import update_number_of_epochs
+
 
 DEFAULT_CONFIG_PATH = "rasa/cli/default_config.yml"
 
 # we reuse a bit of pytest's own testing machinery, this should eventually come
 # from a separatedly installable pytest-cli plugin.
 pytest_plugins = ["pytester"]
+
 
 # https://github.com/pytest-dev/pytest-asyncio/issues/68
 # this event_loop is used by pytest-asyncio, and redefining it
@@ -59,7 +59,7 @@ def event_loop(request: Request) -> Iterator[asyncio.AbstractEventLoop]:
 
 
 @pytest.fixture(scope="session")
-async def _trained_default_agent(tmpdir_factory: TempdirFactory) -> Tuple[Agent, str]:
+async def _trained_default_agent(tmpdir_factory: TempdirFactory) -> Agent:
     model_path = tmpdir_factory.mktemp("model").strpath
 
     agent = Agent(
@@ -86,17 +86,11 @@ async def default_agent(_trained_default_agent: Agent) -> Agent:
 
 
 @pytest.fixture(scope="session")
-async def trained_moodbot_path(tmpdir_factory: TempdirFactory) -> Text:
-    output = tmpdir_factory.mktemp("moodbot").strpath
-    tmp_config_file = os.path.join(output, "config.yml")
-
-    update_number_of_epochs("examples/moodbot/config.yml", tmp_config_file)
-
-    return await train_async(
+async def trained_moodbot_path(trained_async) -> Text:
+    return await trained_async(
         domain="examples/moodbot/domain.yml",
-        config=tmp_config_file,
+        config="examples/moodbot/config.yml",
         training_files="examples/moodbot/data/",
-        output_path=MOODBOT_MODEL_PATH,
     )
 
 
@@ -143,6 +137,11 @@ def default_nlu_data() -> Text:
 
 
 @pytest.fixture(scope="session")
+def incorrect_nlu_data() -> Text:
+    return INCORRECT_NLU_DATA
+
+
+@pytest.fixture(scope="session")
 def end_to_end_story_file() -> Text:
     return END_TO_END_STORY_FILE
 
@@ -153,8 +152,10 @@ def default_config() -> List[Policy]:
 
 
 @pytest.fixture(scope="session")
-def trained_async(tmpdir_factory):
-    async def _train(*args, output_path=None, **kwargs):
+def trained_async(tmpdir_factory: TempdirFactory) -> Callable:
+    async def _train(
+        *args: Any, output_path: Optional[Text] = None, **kwargs: Any
+    ) -> Optional[Text]:
         if output_path is None:
             output_path = str(tmpdir_factory.mktemp("models"))
 
@@ -165,7 +166,7 @@ def trained_async(tmpdir_factory):
 
 @pytest.fixture(scope="session")
 async def trained_rasa_model(
-    trained_async,
+    trained_async: Callable,
     default_domain_path: Text,
     default_nlu_data: Text,
     default_stories_file: Text,
@@ -181,7 +182,7 @@ async def trained_rasa_model(
 
 @pytest.fixture(scope="session")
 async def trained_core_model(
-    trained_async,
+    trained_async: Callable,
     default_domain_path: Text,
     default_nlu_data: Text,
     default_stories_file: Text,
@@ -197,7 +198,7 @@ async def trained_core_model(
 
 @pytest.fixture(scope="session")
 async def trained_nlu_model(
-    trained_async,
+    trained_async: Callable,
     default_domain_path: Text,
     default_config: List[Policy],
     default_nlu_data: Text,
@@ -242,7 +243,7 @@ async def rasa_server_secured(default_agent: Agent) -> Sanic:
 
 @pytest.fixture
 async def rasa_server_without_api() -> Sanic:
-    app = _create_app_without_api()
+    app = rasa.core.run._create_app_without_api()
     channel.register([RestInput()], app, "/webhooks/")
     return app
 

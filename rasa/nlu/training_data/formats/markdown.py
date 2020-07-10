@@ -2,17 +2,30 @@ import logging
 import re
 import typing
 from collections import OrderedDict
-from typing import Any, Text, Optional, Tuple, List, Dict
+from json import JSONDecodeError
+from typing import Any, Text, Optional, Tuple, Dict, Match
 
+from rasa.constants import DOCS_URL_TRAINING_DATA_NLU
 from rasa.core.constants import INTENT_MESSAGE_PREFIX
-
+from rasa.nlu.constants import (
+    ENTITY_ATTRIBUTE_GROUP,
+    ENTITY_ATTRIBUTE_TYPE,
+    ENTITY_ATTRIBUTE_ROLE,
+    ENTITY_ATTRIBUTE_VALUE,
+    ENTITY_ATTRIBUTE_END,
+    ENTITY_ATTRIBUTE_START,
+)
 from rasa.nlu.training_data.formats.readerwriter import (
     TrainingDataReader,
     TrainingDataWriter,
 )
-from rasa.nlu.utils import build_entity
-from rasa.nlu.constants import INTENT
+from rasa.utils.common import raise_warning
 
+GROUP_ENTITY_VALUE = "value"
+GROUP_ENTITY_TYPE = "entity"
+GROUP_ENTITY_DICT = "entity_dict"
+GROUP_ENTITY_TEXT = "entity_text"
+GROUP_COMPLETE_MATCH = 0
 
 if typing.TYPE_CHECKING:
     from rasa.nlu.training_data import Message, TrainingData
@@ -21,12 +34,8 @@ INTENT = "intent"
 SYNONYM = "synonym"
 REGEX = "regex"
 LOOKUP = "lookup"
-available_sections = [INTENT, SYNONYM, REGEX, LOOKUP]
-
-# regex for: `[entity_text](entity_type(:entity_synonym)?)`
-ent_regex = re.compile(
-    r"\[(?P<entity_text>[^\]]+)" r"\]\((?P<entity>[^:)]*?)" r"(?:\:(?P<value>[^)]+))?\)"
-)
+AVAILABLE_SECTIONS = [INTENT, SYNONYM, REGEX, LOOKUP]
+MARKDOWN_SECTION_MARKERS = [f"## {s}:" for s in AVAILABLE_SECTIONS]
 
 item_regex = re.compile(r"\s*[-*+]\s*(.+)")
 comment_regex = re.compile(r"<!--[\s\S]*?--!*>", re.MULTILINE)
@@ -38,10 +47,10 @@ ESCAPE = re.compile(r"[\b\f\n\r\t]")
 
 
 def encode_string(s: Text) -> Text:
-    """Return a encoded python string."""
+    """Return an encoded python string."""
 
-    def replace(match):
-        return ESCAPE_DCT[match.group(0)]
+    def replace(match: Match) -> Text:
+        return ESCAPE_DCT[match.group(GROUP_COMPLETE_MATCH)]
 
     return ESCAPE.sub(replace, s)
 
@@ -53,6 +62,7 @@ class MarkdownReader(TrainingDataReader):
     """Reads markdown training data and creates a TrainingData object."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.current_title = None
         self.current_section = None
         self.training_examples = []
@@ -60,11 +70,12 @@ class MarkdownReader(TrainingDataReader):
         self.regex_features = []
         self.lookup_tables = []
 
+        self._deprecated_synonym_format_was_used = False
+
     def reads(self, s: Text, **kwargs: Any) -> "TrainingData":
         """Read markdown string and create TrainingData object"""
         from rasa.nlu.training_data import TrainingData
 
-        self.__init__()
         s = self._strip_comments(s)
         for line in s.splitlines():
             line = line.strip()
@@ -74,6 +85,20 @@ class MarkdownReader(TrainingDataReader):
             else:
                 self._parse_item(line)
                 self._load_files(line)
+
+        if self._deprecated_synonym_format_was_used:
+            raise_warning(
+                "You are using the deprecated training data format to declare synonyms."
+                " Please use the following format: \n"
+                '[<entity-text>]{"entity": "<entity-type>", "value": '
+                '"<entity-synonym>"}.'
+                "\nYou can use the following command to update your training data file:"
+                "\nsed -i -E 's/\\[([^)]+)\\]\\(([^)]+):([^)]+)\\)/[\\1]{"
+                '"entity": "\\2", "value": "\\3"}/g\' nlu.md',
+                category=FutureWarning,
+                docs=DOCS_URL_TRAINING_DATA_NLU,
+            )
+
         return TrainingData(
             self.training_examples,
             self.entity_synonyms,
@@ -86,7 +111,8 @@ class MarkdownReader(TrainingDataReader):
         """ Removes comments defined by `comment_regex` from `text`. """
         return re.sub(comment_regex, "", text)
 
-    def _find_section_header(self, line: Text) -> Optional[Tuple[Text, Text]]:
+    @staticmethod
+    def _find_section_header(line: Text) -> Optional[Tuple[Text, Text]]:
         """Checks if the current line contains a section header
         and returns the section and the title."""
         match = re.search(r"##\s*(.+?):(.+)", line)
@@ -109,6 +135,9 @@ class MarkdownReader(TrainingDataReader):
 
     def _parse_item(self, line: Text) -> None:
         """Parses an md list item line based on the current section type."""
+        import rasa.nlu.training_data.lookup_tables_parser as lookup_tables_parser
+        import rasa.nlu.training_data.synonyms_parser as synonyms_parser
+
         match = re.match(item_regex, line)
         if match:
             item = match.group(1)
@@ -116,66 +145,66 @@ class MarkdownReader(TrainingDataReader):
                 parsed = self.parse_training_example(item)
                 self.training_examples.append(parsed)
             elif self.current_section == SYNONYM:
-                self._add_synonym(item, self.current_title)
+                synonyms_parser.add_synonym(
+                    item, self.current_title, self.entity_synonyms
+                )
             elif self.current_section == REGEX:
                 self.regex_features.append(
                     {"name": self.current_title, "pattern": item}
                 )
             elif self.current_section == LOOKUP:
-                self._add_item_to_lookup(item)
-
-    def _add_item_to_lookup(self, item: Text) -> None:
-        """Takes a list of lookup table dictionaries.  Finds the one associated
-        with the current lookup, then adds the item to the list."""
-        matches = [l for l in self.lookup_tables if l["name"] == self.current_title]
-        if not matches:
-            self.lookup_tables.append({"name": self.current_title, "elements": [item]})
-        else:
-            elements = matches[0]["elements"]
-            elements.append(item)
+                lookup_tables_parser.add_item_to_lookup_tables(
+                    self.current_title, item, self.lookup_tables
+                )
 
     @staticmethod
-    def _find_entities_in_training_example(example: Text) -> List[Dict]:
-        """Extracts entities from a markdown intent example."""
-        entities = []
-        offset = 0
-        for match in re.finditer(ent_regex, example):
-            entity_text = match.groupdict()["entity_text"]
-            entity_type = match.groupdict()["entity"]
-            if match.groupdict()["value"]:
-                entity_value = match.groupdict()["value"]
-            else:
-                entity_value = entity_text
+    def _get_validated_dict(json_str: Text) -> Dict[Text, Text]:
+        """Converts the provided json_str to a valid dict containing the entity
+        attributes.
 
-            start_index = match.start() - offset
-            end_index = start_index + len(entity_text)
-            offset += len(match.group(0)) - len(entity_text)
+        Users can specify entity roles, synonyms, groups for an entity in a dict, e.g.
+        [LA]{"entity": "city", "role": "to", "value": "Los Angeles"}
 
-            entity = build_entity(start_index, end_index, entity_value, entity_type)
-            entities.append(entity)
+        Args:
+            json_str: the entity dict as string without "{}"
 
-        return entities
+        Raises:
+            ValidationError if validation of entity dict fails.
+            JSONDecodeError if provided entity dict is not valid json.
 
-    def _add_synonym(self, text: Text, value: Text) -> None:
-        from rasa.nlu.training_data.util import check_duplicate_synonym
+        Returns:
+            a proper python dict
+        """
+        import json
+        import rasa.utils.validation as validation_utils
+        import rasa.nlu.schemas.data_schema as schema
 
-        check_duplicate_synonym(self.entity_synonyms, text, value, "reading markdown")
-        self.entity_synonyms[text] = value
+        # add {} as they are not part of the regex
+        try:
+            data = json.loads(f"{{{json_str}}}")
+        except JSONDecodeError as e:
+            raise_warning(
+                f"Incorrect training data format ('{{{json_str}}}'), make sure your "
+                f"data is valid. For more information about the format visit "
+                f"{DOCS_URL_TRAINING_DATA_NLU}."
+            )
+            raise e
 
-    def _add_synonyms(self, plain_text: Text, entities: List[Dict]) -> None:
-        """Adds synonyms found in intent examples"""
-        for e in entities:
-            e_text = plain_text[e["start"] : e["end"]]
-            if e_text != e["value"]:
-                self._add_synonym(e_text, e["value"])
+        validation_utils.validate_training_data(data, schema.entity_dict_schema())
+
+        return data
 
     def parse_training_example(self, example: Text) -> "Message":
         """Extract entities and synonyms, and convert to plain text."""
         from rasa.nlu.training_data import Message
+        import rasa.nlu.training_data.entities_parser as entities_parser
+        import rasa.nlu.training_data.synonyms_parser as synonyms_parser
 
-        entities = self._find_entities_in_training_example(example)
-        plain_text = re.sub(ent_regex, lambda m: m.groupdict()["entity_text"], example)
-        self._add_synonyms(plain_text, entities)
+        entities = entities_parser.find_entities_in_training_example(example)
+        plain_text = entities_parser.replace_entities(example)
+        synonyms_parser.add_synonyms_from_entities(
+            plain_text, entities, self.entity_synonyms
+        )
 
         message = Message.build(plain_text, self.current_title)
 
@@ -185,11 +214,11 @@ class MarkdownReader(TrainingDataReader):
 
     def _set_current_section(self, section: Text, title: Text) -> None:
         """Update parsing mode."""
-        if section not in available_sections:
+        if section not in AVAILABLE_SECTIONS:
             raise ValueError(
                 "Found markdown section '{}' which is not "
                 "in the allowed sections '{}'."
-                "".format(section, "', '".join(available_sections))
+                "".format(section, "', '".join(AVAILABLE_SECTIONS))
             )
 
         self.current_section = section
@@ -275,7 +304,7 @@ class MarkdownWriter(TrainingDataWriter):
         md = ""
         # regex features are already sorted
         lookup_tables = training_data.lookup_tables
-        for i, lookup_table in enumerate(lookup_tables):
+        for lookup_table in lookup_tables:
             md += self._generate_section_header_md(LOOKUP, lookup_table["name"])
             elements = lookup_table["elements"]
             if isinstance(elements, list):
@@ -334,13 +363,34 @@ class MarkdownWriter(TrainingDataWriter):
         return md
 
     @staticmethod
-    def generate_entity_md(text: Text, entity: Dict) -> Text:
+    def generate_entity_md(text: Text, entity: Dict[Text, Any]) -> Text:
         """Generates markdown for an entity object."""
+        import json
 
-        entity_text = text[entity["start"] : entity["end"]]
-        entity_type = entity["entity"]
-        if entity_text != entity["value"]:
-            # add synonym suffix
-            entity_type += ":{}".format(entity["value"])
+        entity_text = text[
+            entity[ENTITY_ATTRIBUTE_START] : entity[ENTITY_ATTRIBUTE_END]
+        ]
+        entity_type = entity.get(ENTITY_ATTRIBUTE_TYPE)
+        entity_value = entity.get(ENTITY_ATTRIBUTE_VALUE)
+        entity_role = entity.get(ENTITY_ATTRIBUTE_ROLE)
+        entity_group = entity.get(ENTITY_ATTRIBUTE_GROUP)
 
-        return f"[{entity_text}]({entity_type})"
+        if entity_value and entity_value == entity_text:
+            entity_value = None
+
+        use_short_syntax = (
+            entity_value is None and entity_role is None and entity_group is None
+        )
+
+        if use_short_syntax:
+            return f"[{entity_text}]({entity_type})"
+
+        entity_dict = {
+            ENTITY_ATTRIBUTE_TYPE: entity_type,
+            ENTITY_ATTRIBUTE_ROLE: entity_role,
+            ENTITY_ATTRIBUTE_GROUP: entity_group,
+            ENTITY_ATTRIBUTE_VALUE: entity_value,
+        }
+        entity_dict = {k: v for k, v in entity_dict.items() if v is not None}
+
+        return f"[{entity_text}]{json.dumps(entity_dict)}"
