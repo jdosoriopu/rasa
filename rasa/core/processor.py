@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import warnings
 from types import LambdaType
 from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
@@ -18,6 +19,9 @@ from rasa.core.channels.channel import (
     CollectingOutputChannel,
     OutputChannel,
     UserMessage,
+)
+from rasa.core.channels.evachannel import (
+    EvaOutput
 )
 from rasa.core.constants import (
     USER_INTENT_BACK,
@@ -546,6 +550,7 @@ class MessageProcessor:
         num_predicted_actions = 0
 
         # action loop. predicts actions until we hit action listen
+        message = ""
         while (
             should_predict_another_action
             and self._should_handle_message(tracker)
@@ -554,10 +559,23 @@ class MessageProcessor:
             # this actually just calls the policy's method by the same name
             action, policy, confidence = self.predict_next_action(tracker)
 
-            should_predict_another_action = await self._run_action(
+            should_predict_another_action, messages = await self._run_action(
                 action, tracker, output_channel, self.nlg, policy, confidence
             )
+            if messages:
+
+                if len(messages) > 2:
+                    if messages[0] == '¿':
+                        messages = messages[0] + messages[1:2].capitalize() + messages[2:]
+                    else:
+                        messages = messages[0:2].capitalize() + messages[2:]
+                if messages: message += messages + ". "
             num_predicted_actions += 1
+
+        if message and not tracker.get_slot("first_name") is None:
+            message = message[:-2]
+            message = message.strip()
+            await output_channel.send_response(tracker.sender_id, { 'text': message })
 
         if self.is_action_limit_reached(
             num_predicted_actions, should_predict_another_action
@@ -593,11 +611,19 @@ class MessageProcessor:
     ) -> None:
         """Send all the bot messages that are logged in the events array."""
 
+        message = ""
         for e in events:
             if not isinstance(e, BotUttered):
                 continue
 
-            await output_channel.send_response(tracker.sender_id, e.message())
+            if not e.message().get("text"):
+                continue
+           
+            message += e.message().get("text")
+
+        return message
+
+        #await output_channel.send_response(tracker.sender_id, { 'text': message })
 
     async def _schedule_reminders(
         self,
@@ -642,7 +668,7 @@ class MessageProcessor:
                         scheduler.remove_job(scheduled_job.id)
 
     async def _run_action(
-        self, action, tracker, output_channel, nlg, policy=None, confidence=None
+        self, action, tracker, output_channel, nlg, policy=None, confidence=None, join=False
     ) -> bool:
         # events and return values are used to update
         # the tracker state after an action has been taken
@@ -668,11 +694,11 @@ class MessageProcessor:
         ):
             self._log_slots(tracker)
 
-        await self._send_bot_messages(events, tracker, output_channel)
+        messages = await self._send_bot_messages(events, tracker, output_channel)
         await self._schedule_reminders(events, tracker, output_channel, nlg)
         await self._cancel_reminders(events, tracker)
 
-        return self.should_predict_another_action(action.name())
+        return self.should_predict_another_action(action.name()), messages
 
     def _warn_about_new_slots(self, tracker, action_name, events) -> None:
         # these are the events from that action we have seen during training
