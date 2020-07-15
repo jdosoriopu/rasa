@@ -6,6 +6,7 @@ from types import LambdaType
 from typing import Any, Dict, List, Optional, Text, Tuple, Union
 
 import numpy as np
+from datetime import datetime
 
 from rasa.constants import DOCS_URL_POLICIES, DOCS_URL_DOMAINS
 from rasa.core import jobs
@@ -572,7 +573,7 @@ class MessageProcessor:
                 if messages: message += messages + ". "
             num_predicted_actions += 1
 
-        if message and not tracker.get_slot("first_name") is None:
+        if message and self.validate_tracker(tracker):
             message = message[:-2]
             message = message.strip()
             await output_channel.send_response(tracker.sender_id, { 'text': message })
@@ -580,7 +581,7 @@ class MessageProcessor:
         if self.is_action_limit_reached(
             num_predicted_actions, should_predict_another_action
         ):
-            # circuit breaker was tripped
+            # circuit breaker was tripped 
             logger.warning(
                 "Circuit breaker tripped. Stopped predicting "
                 f"more actions for sender '{tracker.sender_id}'."
@@ -588,6 +589,15 @@ class MessageProcessor:
             if self.on_circuit_break:
                 # call a registered callback
                 self.on_circuit_break(tracker, output_channel, self.nlg)
+
+    @staticmethod
+    def validate_tracker(tracker) -> bool:
+        common_variable = tracker.get_slot("first_name")
+        start_date = tracker.get_slot("start_date")
+        end_date = tracker.get_slot("end_date")
+        weekdays = tracker.get_slot("weekdays")
+
+        return not common_variable is None and datetime.now().hour >= start_date and datetime.now().hour <= end_date and datetime.now().weekday() in weekdays
 
     @staticmethod
     def should_predict_another_action(action_name: Text) -> bool:
