@@ -78,10 +78,6 @@ class EvaInput(RestInput):
             if "#eva" in text.lower():
 
                 await on_new_message(
-                    UserMessage("/restart", output_channel, sender, input_channel=self.name())
-                )
-
-                await on_new_message(
                     UserMessage("/start_bot", output_channel, sender, input_channel=self.name())
                 )
 
