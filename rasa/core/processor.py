@@ -592,12 +592,17 @@ class MessageProcessor:
 
     @staticmethod
     def validate_tracker(tracker) -> bool:
-        common_variable = tracker.get_slot("first_name")
-        start_date = tracker.get_slot("start_time")
-        end_date = tracker.get_slot("end_time")
-        weekdays = tracker.get_slot("weekdays")
+        try:
+            start_date = tracker.get_slot("start_time")
+            end_date = tracker.get_slot("end_time")
+            weekdays = tracker.get_slot("weekdays")
 
-        return not common_variable is None and datetime.now().hour >= start_date and datetime.now().hour <= end_date and datetime.now().weekday() in weekdays
+            return datetime.now().hour >= start_date and datetime.now().hour <= end_date and datetime.now().weekday() in weekdays
+        except:
+            logger.error(
+                    f"weeddays or start_time or end_time is not set!"
+                )
+            return False
 
     @staticmethod
     def should_predict_another_action(action_name: Text) -> bool:
