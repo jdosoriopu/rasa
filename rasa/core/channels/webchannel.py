@@ -1,5 +1,5 @@
 import logging
-from typing import Text, Dict, Optional, Callable, Awaitable, Any
+from typing import Text, Dict, Optional, List, Callable, Awaitable, Any
 
 from sanic import Blueprint, response
 from sanic.request import Request
@@ -26,6 +26,43 @@ class WebOutput(OutputChannel):
         self.eva_endpoint = endpoint
         self.device = device
         super().__init__()
+
+
+    async def send_text_with_buttons(
+        self,
+        recipient_id: Text,
+        text: Text,
+        buttons: List[Dict[Text, Any]],
+        **kwargs: Any,
+    ) -> None:
+        """Sends buttons to the output.
+
+        Default implementation will just post the buttons as a string."""
+
+        button_block = {"type": "actions", "elements": []}
+        for button in buttons:
+            button_block["elements"].append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": button["title"]},
+                    "value": button["payload"],
+                }
+            )
+        try:
+            await self.eva_endpoint.request(
+                "post", content_type="application/json", json={
+                    "from": self.device,
+                    "text": text,
+                    "to": recipient_id,
+                    "buttons": button_block
+                }
+            )
+        except ClientResponseError as e:
+            logger.error(
+                "Failed to send output message to WhatsAppi. "
+                "Status: {} Response: {}"
+                "".format(e.status, e.text)
+            )
 
     async def send_text_message(
         self, recipient_id: Text, text: Text, **kwargs: Any

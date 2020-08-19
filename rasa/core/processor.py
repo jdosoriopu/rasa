@@ -631,14 +631,14 @@ class MessageProcessor:
             if not isinstance(e, BotUttered):
                 continue
 
-            if not e.message().get("text"):
+            if e.message().get("buttons"):
+                await output_channel.send_response(tracker.sender_id, e.message())
+            elif not e.message().get("text"):
                 continue
-           
-            message += e.message().get("text")
+            else:
+                message += e.message().get("text")
 
         return message
-
-        #await output_channel.send_response(tracker.sender_id, { 'text': message })
 
     async def _schedule_reminders(
         self,
