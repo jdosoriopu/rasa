@@ -109,7 +109,7 @@ class WebInput(RestInput):
             sender = request.json.get("contact", None)
             text = request.json.get("message", None)
             device = request.json.get("device", None)
-            self.eva_endpoint['url'] = request.json.get("ip", None)
+            self.eva_endpoint.url = request.json.get("ip", None)
 
             output_channel = self.get_output_channel(device)
 
